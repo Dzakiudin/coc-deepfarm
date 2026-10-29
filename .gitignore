@@ -1,0 +1,65 @@
+# Virtual environment
+coc/
+venv/
+env/
+.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+
+# Model files (large, keep locally)
+# Keep the models/ folder tracked, but ignore model artifacts outside it if needed.
+# *.pt
+# *.pth
+# models/
+
+# EasyOCR weights bundled into the build (large, re-downloadable)
+assets/easyocr_data/model/*.pth
+
+# Build and packaging (EXE artifacts)
+build/
+build-*/
+dist/
+dist-*/
+*.spec
+*.spec.bak
+*.exe
+build.bat
+
+# Logs
+logs/
+logs_*/
+*.log
+
+# Local user settings (selected emulator window)
+settings.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# OS
+Thumbs.db
+.env
+.env.local
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+.jupyter/
+
+# Backup
+archive/
+backup/
+*.bak
+mcp-oauth-server.mjs
+MCP.md

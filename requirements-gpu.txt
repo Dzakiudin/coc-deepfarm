@@ -1,0 +1,5 @@
+# Optional Windows/NVIDIA profile. Install after requirements.txt.
+# CUDA 12.8 wheels are compatible with RTX 40-series GPUs and Python 3.12.
+--index-url https://download.pytorch.org/whl/cu128
+torch==2.11.0+cu128
+torchvision==0.26.0+cu128
