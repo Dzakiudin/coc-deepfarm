@@ -2,13 +2,16 @@ import glob
 import json
 import os
 import queue
+import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from PIL import Image, ImageDraw, ImageTk
+import cv2
 import numpy as np
+from PIL import Image, ImageDraw, ImageTk
 
 from ai.brain import train_commander_from_data
 from ai.policy_net import train_policy_from_dataset
@@ -43,9 +46,9 @@ class BotGUI:
         self.bot = bot
         self.msg_queue = msg_queue
         self.settings = dict(settings or {})
-        self.root.title("Coc-DeepFarm | Live Dashboard | By jakijekiiii")
-        self.root.geometry("1480x860")
-        self.root.minsize(1120, 720)
+        self.root.title("Coc-DeepFarm | Dual-Brain CoC AI Dashboard | By jakijekiiii")
+        self.root.geometry("1480x880")
+        self.root.minsize(1120, 740)
         self.root.configure(bg=self.BG)
 
         self.bot_status = "stopped"
@@ -56,6 +59,10 @@ class BotGUI:
         self.latest_frame = None
         self.latest_detections = {}
         self.latest_loot = {}
+        self.latest_ai_overlay = {}
+        self.show_ai_radar = True
+        self.chart_mode = "ai"  # 'ai' (RL Learning Curve) or 'perf' (System Latency ms)
+        self.rl_history = []
         self.latest_metrics = {"capture_ms": 0.0, "yolo_ms": 0.0, "ocr_ms": 0.0}
         self.performance_history = []
         self.raids = []
@@ -75,6 +82,7 @@ class BotGUI:
         self._build_styles()
         self._build_ui()
         self._load_recent_raids()
+        self._load_rl_history()
         self._refresh_all()
         self._poll_queue()
         self._tick()
@@ -267,7 +275,7 @@ class BotGUI:
         ).pack(side="left")
         tk.Label(
             title_row,
-            text="v1.0.0",
+            text="v2.0 DeepRL",
             bg="#143829",
             fg=self.GREEN,
             font=("Segoe UI", 8, "bold"),
@@ -277,12 +285,13 @@ class BotGUI:
 
         tk.Label(
             header,
-            text="AI-Powered Clash of Clans Farming Bot  ·  By jakijekiiii",
+            text="Dual-Brain Clash of Clans Neural Farming Bot  ·  By jakijekiiii",
             bg="#0b1222",
             fg=self.MUTED,
             font=("Segoe UI", 8),
         ).grid(row=1, column=1, sticky="nw")
 
+        # Interactive Quick-Action Toolbar (replaces old static dummy tags)
         nav_pill = tk.Frame(
             header,
             bg="#121d33",
@@ -292,25 +301,65 @@ class BotGUI:
             highlightthickness=1,
         )
         nav_pill.grid(row=0, column=2, rowspan=2)
-        tk.Label(
+        self.brain_device_badge = tk.Label(
             nav_pill,
-            text="⌂  Dashboard",
-            bg="#25427b",
-            fg="#ffffff",
-            font=("Segoe UI", 9, "bold"),
-            padx=12,
+            text="🧠 CoC Neural Brain: Ready",
+            bg="#1e1b4b",
+            fg="#c4b5fd",
+            font=("Segoe UI", 8, "bold"),
+            padx=10,
             pady=4,
-        ).pack(side="left", padx=(0, 4))
-        for tag_text in ("⚙  YOLO Vision", "☰  OCR Pipeline", "⚡  ADB Control", "✦  Gemini AI"):
-            tk.Label(
-                nav_pill,
-                text=tag_text,
-                bg="#121d33",
-                fg=self.MUTED,
-                font=("Segoe UI", 8),
-                padx=10,
-                pady=4,
-            ).pack(side="left")
+        )
+        self.brain_device_badge.pack(side="left", padx=(0, 6))
+
+        self.quick_retrain_btn = tk.Button(
+            nav_pill,
+            text="⚡ Retrain AI",
+            command=self._on_quick_retrain_ai,
+            bg="#172554",
+            activebackground="#1e3a8a",
+            fg="#93c5fd",
+            activeforeground="#ffffff",
+            relief="flat",
+            bd=0,
+            padx=10,
+            pady=3,
+            font=("Segoe UI", 8, "bold"),
+            cursor="hand2",
+        )
+        self.quick_retrain_btn.pack(side="left", padx=3)
+
+        tk.Button(
+            nav_pill,
+            text="🎯 Calibrate",
+            command=self._on_open_calibrator,
+            bg="#162038",
+            activebackground="#1e293b",
+            fg=self.TEXT,
+            activeforeground="#ffffff",
+            relief="flat",
+            bd=0,
+            padx=10,
+            pady=3,
+            font=("Segoe UI", 8, "bold"),
+            cursor="hand2",
+        ).pack(side="left", padx=3)
+
+        tk.Button(
+            nav_pill,
+            text="📸 Snapshot",
+            command=self._on_save_snapshot,
+            bg="#162038",
+            activebackground="#1e293b",
+            fg=self.CYAN,
+            activeforeground="#ffffff",
+            relief="flat",
+            bd=0,
+            padx=10,
+            pady=3,
+            font=("Segoe UI", 8, "bold"),
+            cursor="hand2",
+        ).pack(side="left", padx=(3, 0))
 
         status_card = tk.Frame(
             header,
@@ -332,7 +381,7 @@ class BotGUI:
         self.connection_badge.pack(anchor="w")
         tk.Label(
             status_card,
-            text="ADB Telemetry  ·  127.0.0.1",
+            text="ADB Stream  ·  CUDA Accelerated",
             bg="#101b30",
             fg=self.MUTED,
             font=("Segoe UI", 7),
@@ -349,7 +398,7 @@ class BotGUI:
         self.hero_canvas = tk.Canvas(
             hero_wrap,
             bg="#0e192d",
-            height=96,
+            height=90,
             highlightthickness=0,
             bd=0,
         )
@@ -369,11 +418,12 @@ class BotGUI:
         for col in range(6):
             metrics.grid_columnconfigure(col, weight=1, uniform="kpi")
         self.metric_vars = {}
-        self._metric_card(metrics, 0, "Total Gold", "gold", self.GOLD, "Session gains", "gold_lg")
-        self._metric_card(metrics, 1, "Total Elixir", "elixir", self.ELIXIR, "Session gains", "elixir_lg")
-        self._metric_card(metrics, 2, "Total Dark Elixir", "delixir", self.PURPLE, "Session gains", "delixir_lg")
-        self._metric_card(metrics, 3, "Total Raids", "raids", self.TEXT, "Loaded + current session", "raids_lg")
-        self._metric_card(metrics, 4, "Session Progress", "progress", self.GOLD, "Positive goals", "progress_lg")
+        self.metric_hint_vars = {}
+        self._metric_card(metrics, 0, "Total Gold", "gold", self.GOLD, "0 / hr", "gold_lg")
+        self._metric_card(metrics, 1, "Total Elixir", "elixir", self.ELIXIR, "0 / hr", "elixir_lg")
+        self._metric_card(metrics, 2, "Total Dark Elixir", "delixir", self.PURPLE, "0 / hr", "delixir_lg")
+        self._metric_card(metrics, 3, "Total Raids", "raids", self.TEXT, "Avg drain —", "raids_lg")
+        self._metric_card(metrics, 4, "Session Progress", "progress", self.GOLD, "Target goals", "progress_lg")
         self._metric_card(metrics, 5, "Runtime", "runtime", self.CYAN, "Current run", "runtime_lg")
 
         live = self._panel(body, padx=12, pady=10)
@@ -398,7 +448,25 @@ class BotGUI:
             padx=9,
             pady=3,
         )
-        self.live_badge.pack(side="left", padx=(10, 8))
+        self.live_badge.pack(side="left", padx=(10, 6))
+
+        self.radar_toggle_btn = tk.Button(
+            live_header,
+            text="👁 AI Radar: ON",
+            command=self._on_toggle_ai_radar,
+            bg="#143829",
+            activebackground="#166534",
+            fg=self.GREEN,
+            activeforeground="#ffffff",
+            relief="flat",
+            bd=0,
+            padx=8,
+            pady=2,
+            font=("Segoe UI", 8, "bold"),
+            cursor="hand2",
+        )
+        self.radar_toggle_btn.pack(side="left", padx=(2, 8))
+
         self.preview_info = tk.StringVar(value="No emulator frame received yet")
         tk.Label(
             live_header,
@@ -545,7 +613,7 @@ class BotGUI:
         control.grid(row=1, column=2, sticky="nsew", pady=(0, 8))
         control.grid_columnconfigure(0, weight=1)
         control.grid_rowconfigure(1, weight=1)
-        self._label(control, "Farming Control", size=12, bold=True).grid(
+        self._label(control, "Farming & Neural Brain Control", size=12, bold=True).grid(
             row=0, column=0, sticky="w", pady=(0, 6)
         )
 
@@ -597,8 +665,8 @@ class BotGUI:
 
         control_inner.grid_columnconfigure(0, weight=1)
 
-        self.min_gold = tk.IntVar(value=1000000)
-        self.min_elixir = tk.IntVar(value=1000000)
+        self.min_gold = tk.IntVar(value=700000)
+        self.min_elixir = tk.IntVar(value=700000)
         self.min_dark = tk.IntVar(value=0)
         self.goal_gold = tk.IntVar(value=20000000)
         self.goal_elixir = tk.IntVar(value=20000000)
@@ -607,13 +675,35 @@ class BotGUI:
         minimum_box = tk.Frame(control_inner, bg=self.PANEL)
         minimum_box.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         minimum_box.grid_columnconfigure(1, weight=1)
+        min_hdr = tk.Frame(minimum_box, bg=self.PANEL)
+        min_hdr.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 4))
         self._label(
-            minimum_box,
-            "Target per Raid (Minimum Loot)",
+            min_hdr,
+            "Target per Raid (Minimum)",
             size=9,
             color=self.MUTED,
             bold=True,
-        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        ).pack(side="left")
+        # Quick Loot Presets
+        preset_bar = tk.Frame(min_hdr, bg=self.PANEL)
+        preset_bar.pack(side="right")
+        for lbl, val in [("400k", 400_000), ("700k", 700_000), ("1M+", 1_000_000)]:
+            tk.Button(
+                preset_bar,
+                text=lbl,
+                command=lambda v=val: self._apply_loot_preset(v),
+                bg="#162038",
+                activebackground="#1e3a8a",
+                fg=self.CYAN,
+                activeforeground="#ffffff",
+                relief="flat",
+                bd=0,
+                padx=5,
+                pady=1,
+                font=("Segoe UI", 7, "bold"),
+                cursor="hand2",
+            ).pack(side="left", padx=1)
+
         self._target_row(minimum_box, 1, "Gold", self.min_gold, self.GOLD, "gold_sm")
         self._target_row(minimum_box, 2, "Elixir", self.min_elixir, self.ELIXIR, "elixir_sm")
         self._target_row(minimum_box, 3, "Dark", self.min_dark, self.PURPLE, "delixir_sm")
@@ -637,13 +727,13 @@ class BotGUI:
         strategy_box.grid_columnconfigure(1, weight=1)
         self._label(
             strategy_box,
-            "Strategy Mode",
+            "Brain Mode",
             size=9,
             color=self.MUTED,
             bold=True,
         ).grid(row=0, column=0, sticky="w", padx=(0, 8))
         self.ai_mode_var = tk.BooleanVar(
-            value=bool(getattr(self.bot, "ai_enabled", False))
+            value=bool(getattr(self.bot, "ai_enabled", True))
         )
         self.ai_mode_text = tk.StringVar()
         self.ai_mode_btn = tk.Checkbutton(
@@ -667,7 +757,6 @@ class BotGUI:
             cursor="hand2",
         )
         self.ai_mode_btn.grid(row=0, column=1, sticky="ew")
-        self._update_ai_mode_control()
 
         self._label(
             strategy_box,
@@ -705,7 +794,7 @@ class BotGUI:
 
         self._label(
             strategy_box,
-            "Video AI",
+            "Video Trainer",
             size=9,
             color=self.MUTED,
             bold=True,
@@ -729,8 +818,41 @@ class BotGUI:
         )
         self.learn_video_btn.grid(row=2, column=1, sticky="ew", pady=(6, 0))
 
+        # Live CoC Neural Brain Telemetry Card
+        ai_card = tk.Frame(
+            control_inner,
+            bg="#0b1324",
+            padx=8,
+            pady=6,
+            highlightbackground="#312e81",
+            highlightthickness=1,
+        )
+        ai_card.grid(row=3, column=0, sticky="ew", pady=(0, 8))
+        ai_card.grid_columnconfigure(0, weight=1)
+        self.ai_telemetry_title = tk.StringVar(value="🧠 Neural Memory: Active")
+        self.ai_telemetry_detail = tk.StringVar(value="Loading policy & commander stats...")
+        tk.Label(
+            ai_card,
+            textvariable=self.ai_telemetry_title,
+            bg="#0b1324",
+            fg="#a5b4fc",
+            font=("Segoe UI", 8, "bold"),
+            anchor="w",
+        ).grid(row=0, column=0, sticky="ew")
+        tk.Label(
+            ai_card,
+            textvariable=self.ai_telemetry_detail,
+            bg="#0b1324",
+            fg=self.MUTED,
+            font=("Consolas", 7),
+            justify="left",
+            anchor="w",
+        ).grid(row=1, column=0, sticky="ew", pady=(2, 0))
+
+        self._update_ai_mode_control()
+
         controls = tk.Frame(control_inner, bg=self.PANEL)
-        controls.grid(row=3, column=0, sticky="ew", pady=(2, 0))
+        controls.grid(row=4, column=0, sticky="ew", pady=(2, 0))
         controls.grid_columnconfigure(0, weight=1)
         self.start_btn = tk.Button(
             controls,
@@ -752,7 +874,7 @@ class BotGUI:
 
         self.stop_btn = tk.Button(
             controls,
-            text="■   Stop",
+            text="■   Stop (F12)",
             command=self._on_stop,
             bg="#5c212b",
             activebackground="#991b1b",
@@ -770,7 +892,7 @@ class BotGUI:
         self.stop_btn.grid(row=1, column=0, sticky="ew")
 
         self.status_detail = tk.StringVar(
-            value="F12 emergency stop · controls stay in this panel"
+            value="F12 emergency stop · Online RL active"
         )
         tk.Label(
             control_inner,
@@ -780,7 +902,7 @@ class BotGUI:
             font=("Segoe UI", 7),
             wraplength=290,
             justify="left",
-        ).grid(row=4, column=0, sticky="w", pady=(6, 2))
+        ).grid(row=5, column=0, sticky="w", pady=(6, 2))
 
         recent = self._panel(body, padx=12, pady=10)
         recent.grid(row=2, column=0, sticky="nsew", padx=(0, 8))
@@ -847,7 +969,7 @@ class BotGUI:
         logs.grid_rowconfigure(1, weight=1)
         log_header = tk.Frame(logs, bg=self.PANEL)
         log_header.grid(row=0, column=0, sticky="ew", pady=(0, 6))
-        self._label(log_header, "Live Log", size=11, bold=True).pack(side="left")
+        self._label(log_header, "Live Log & Self-Learning Feed", size=11, bold=True).pack(side="left")
         tk.Button(
             log_header,
             text="Clear",
@@ -906,9 +1028,13 @@ class BotGUI:
             "success", background="#15803d", foreground="#ffffff", font=("Consolas", 7, "bold")
         )
         self.log_text.tag_configure(
+            "ai", background="#6d28d9", foreground="#ffffff", font=("Consolas", 7, "bold")
+        )
+        self.log_text.tag_configure(
             "error", background="#b91c1c", foreground="#ffffff", font=("Consolas", 7, "bold")
         )
         self.log_text.tag_configure("msg_success", foreground=self.GREEN)
+        self.log_text.tag_configure("msg_ai", foreground="#c4b5fd")
         self.log_text.tag_configure("msg_error", foreground=self.RED)
 
         perf = self._panel(body, padx=12, pady=10)
@@ -918,16 +1044,30 @@ class BotGUI:
 
         perf_hdr = tk.Frame(perf, bg=self.PANEL)
         perf_hdr.grid(row=0, column=0, sticky="ew")
-        self._label(perf_hdr, "Performance", size=11, bold=True).pack(side="left")
+        self.perf_title_var = tk.StringVar(value="AI Self-Learning & Telemetry")
         tk.Label(
             perf_hdr,
-            text="Live Telemetry",
+            textvariable=self.perf_title_var,
+            bg=self.PANEL,
+            fg=self.TEXT,
+            font=("Segoe UI", 11, "bold"),
+        ).pack(side="left")
+        self.chart_toggle_btn = tk.Button(
+            perf_hdr,
+            text="🧠 AI Curve  ⇄  Latency",
+            command=self._on_toggle_chart_mode,
             bg="#3b49df",
+            activebackground="#4f46e5",
             fg="#ffffff",
+            activeforeground="#ffffff",
             font=("Segoe UI", 7, "bold"),
-            padx=7,
+            relief="flat",
+            bd=0,
+            padx=8,
             pady=2,
-        ).pack(side="right")
+            cursor="hand2",
+        )
+        self.chart_toggle_btn.pack(side="right")
 
         perf_cards = tk.Frame(perf, bg=self.PANEL)
         perf_cards.grid(row=1, column=0, sticky="ew", pady=(7, 6))
@@ -992,7 +1132,7 @@ class BotGUI:
         )
         self.perf_canvas.grid(row=2, column=0, sticky="nsew")
         self.perf_canvas.bind("<Configure>", lambda _event: self._draw_performance())
-        self.perf_note = tk.StringVar(value="Measured milliseconds · waiting for telemetry")
+        self.perf_note = tk.StringVar(value="Online RL Self-Learning Curve · Green=Reinforce · Gold=Mistake Fix")
         tk.Label(
             perf,
             textvariable=self.perf_note,
@@ -1004,7 +1144,7 @@ class BotGUI:
 
         footer = tk.Frame(self.root, bg=self.BG, padx=16, pady=4)
         footer.grid(row=3, column=0, sticky="ew")
-        self.footer_var = tk.StringVar(value="Coc-DeepFarm · Live telemetry · Local dashboard")
+        self.footer_var = tk.StringVar(value="Coc-DeepFarm · CoCCommanderNet + AttackPolicyNet · Online RL Active")
         tk.Label(
             footer,
             textvariable=self.footer_var,
@@ -1013,10 +1153,128 @@ class BotGUI:
             font=("Segoe UI", 8),
         ).pack(anchor="w")
 
+    def _apply_loot_preset(self, amount: int):
+        self.min_gold.set(int(amount))
+        self.min_elixir.set(int(amount))
+        self._log(f"[Preset] Minimum Raid Loot set to Gold {amount:,} / Elixir {amount:,}")
+
+    def _on_toggle_ai_radar(self):
+        self.show_ai_radar = not self.show_ai_radar
+        if self.show_ai_radar:
+            self.radar_toggle_btn.config(text="👁 AI Radar: ON", bg="#143829", fg=self.GREEN)
+        else:
+            self.radar_toggle_btn.config(text="👁 AI Radar: OFF", bg="#1e293b", fg=self.MUTED)
+        self._preview_needs_render = True
+        self._render_preview()
+
+    def _on_toggle_chart_mode(self):
+        self.chart_mode = "perf" if self.chart_mode == "ai" else "ai"
+        if self.chart_mode == "ai":
+            self._load_rl_history()
+            self.perf_note.set("Online RL Self-Learning Curve · Green=Reinforce · Gold=Mistake Fix")
+        else:
+            self.perf_note.set("Measured milliseconds · Capture / YOLO / OCR latency")
+        self._draw_performance()
+
+    def _on_open_calibrator(self):
+        if self.bot.is_running():
+            messagebox.showwarning(
+                "Calibrate Controls",
+                "Stop the bot first before opening the button calibrator.",
+            )
+            return
+        try:
+            cal_script = user_path("ui/calibrate.py")
+            subprocess.Popen([sys.executable, cal_script])
+            self._log("[Calibrator] Launched ui/calibrate.py in a separate window.")
+        except Exception as exc:
+            messagebox.showerror("Calibrate Controls", f"Could not launch calibrator: {exc}")
+
+    def _on_save_snapshot(self):
+        if self.latest_frame is None:
+            messagebox.showinfo("Snapshot", "No emulator frame available yet.")
+            return
+        try:
+            log_dir = user_path("logs")
+            os.makedirs(log_dir, exist_ok=True)
+            out_path = os.path.join(
+                log_dir, f"snapshot_{time.strftime('%Y%m%d_%H%M%S')}.png"
+            )
+            cv2.imwrite(out_path, self.latest_frame)
+            self._log(f"[Snapshot] Saved current emulator screen to logs/{os.path.basename(out_path)}")
+        except Exception as exc:
+            self._log(f"[Snapshot] Failed to save screenshot: {exc}")
+
+    def _on_quick_retrain_ai(self):
+        if self.bot.is_running():
+            messagebox.showwarning(
+                "Retrain AI",
+                "Stop the bot first before retraining the neural networks.",
+            )
+            return
+        self.quick_retrain_btn.config(state="disabled", text="⏳ Training...")
+        self._log("[Deep Learning] Retraining CoCCommanderNet + AttackPolicyNet from dataset & raid history...")
+
+        def _worker():
+            try:
+                p_metrics = train_policy_from_dataset(epochs=80)
+                c_metrics = train_commander_from_data(epochs=90)
+                if getattr(self.bot, "policy_planner", None) is not None:
+                    self.bot.policy_planner.reload()
+                if getattr(self.bot, "brain_alt", None) is not None and hasattr(self.bot.brain_alt, "reload"):
+                    self.bot.brain_alt.reload()
+                self.msg_queue.put(
+                    {
+                        "type": "log",
+                        "text": (
+                            f"[Deep Learning] Retrain complete on {p_metrics['device']}! "
+                            f"PolicySamples={p_metrics['samples']} (loss={p_metrics['final_loss']:.4f}), "
+                            f"CommanderSamples={c_metrics['samples']} (loss={c_metrics['final_loss']:.4f})"
+                        ),
+                    }
+                )
+            except Exception as exc:
+                self.msg_queue.put(
+                    {
+                        "type": "log",
+                        "text": f"[Deep Learning] Retrain error: {exc}",
+                    }
+                )
+            finally:
+                self.root.after(
+                    0,
+                    lambda: (
+                        self.quick_retrain_btn.config(state="normal", text="⚡ Retrain AI"),
+                        self._update_ai_mode_control(),
+                        self._load_rl_history(),
+                        self._draw_performance(),
+                    ),
+                )
+
+        threading.Thread(target=_worker, daemon=True, name="QuickRetrainThread").start()
+
+    def _load_rl_history(self):
+        path = user_path("dataset/self_learned_raids.jsonl")
+        entries = []
+        if os.path.isfile(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            entries.append(json.loads(line))
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+        self.rl_history = entries[-40:]
+
     def _draw_hero_banner(self, _event=None):
         canvas = self.hero_canvas
         width = max(600, canvas.winfo_width())
-        height = max(88, canvas.winfo_height())
+        height = max(84, canvas.winfo_height())
         canvas.delete("all")
 
         grad = Image.new("RGB", (width, height), "#0d1629")
@@ -1047,32 +1305,32 @@ class BotGUI:
 
         canvas.create_text(
             22,
-            12,
+            10,
             text="Coc-",
             anchor="nw",
             fill="#ffffff",
-            font=("Segoe UI", 24, "bold"),
+            font=("Segoe UI", 23, "bold"),
         )
         canvas.create_text(
-            98,
-            12,
+            96,
+            10,
             text="DeepFarm",
             anchor="nw",
             fill="#818cf8",
-            font=("Segoe UI", 24, "bold"),
+            font=("Segoe UI", 23, "bold"),
         )
         canvas.create_text(
             24,
-            50,
-            text="Automated Clash of Clans Farming Bot",
+            46,
+            text="Autonomous Dual-Brain Clash of Clans Deep Learning Bot",
             anchor="nw",
             fill="#e2e8f0",
-            font=("Segoe UI", 11, "bold"),
+            font=("Segoe UI", 10, "bold"),
         )
         canvas.create_text(
             24,
-            72,
-            text="Computer Vision   •   OCR   •   CoC Deep Learning Brain   •   Online Self-Learning RL   •   ADB Control",
+            68,
+            text="YOLO Vision   •   High-Contrast OCR   •   CoCCommanderNet   •   AttackPolicyNet   •   Online Self-Learning RL",
             anchor="nw",
             fill="#94a3b8",
             font=("Segoe UI", 8),
@@ -1168,9 +1426,11 @@ class BotGUI:
 
         bottom_row = tk.Frame(card, bg=self.PANEL)
         bottom_row.grid(row=2, column=1, sticky="ew")
+        hint_var = tk.StringVar(value=f"↑ {hint}")
+        self.metric_hint_vars[key] = hint_var
         tk.Label(
             bottom_row,
-            text=f"↑ {hint}",
+            textvariable=hint_var,
             bg=self.PANEL,
             fg=self.GREEN if key in ("gold", "elixir", "delixir", "progress") else self.MUTED,
             font=("Segoe UI", 7, "bold"),
@@ -1279,9 +1539,9 @@ class BotGUI:
 
     def _update_ai_mode_control(self):
         mode = self._current_strategy_mode()
-        policy_ready = bool(
-            getattr(getattr(self.bot, "policy_planner", None), "loaded", False)
-        )
+        planner = getattr(self.bot, "policy_planner", None)
+        commander = getattr(self.bot, "brain_alt", None)
+        policy_ready = bool(getattr(planner, "loaded", False))
         suffix = " + PolicyNet" if policy_ready else ""
         labels = {
             "coc_ai": f"CoC Deep AI (Commander{suffix})  ▾",
@@ -1295,6 +1555,34 @@ class BotGUI:
             state="disabled" if running else "normal",
             fg=self.TEXT,
         )
+
+        # Refresh Neural Memory Card & Header Badge
+        prof = getattr(planner, "strategy_profile", {}) if planner else {}
+        c_stats = getattr(commander, "stats", {}) if commander else {}
+        mem_bank_obj = getattr(commander, "memory_bank", None) if commander else None
+        mem_count = len(getattr(mem_bank_obj, "entries", [])) if mem_bank_obj else int(c_stats.get("memory_bank_size", 0))
+        mem_recalls = int(getattr(mem_bank_obj, "total_recalls", c_stats.get("memory_recalls", 0)))
+        dev = getattr(planner, "device", None) or getattr(commander, "device", "cuda:0")
+        raids_self = int(prof.get("raids_self_learned", 0))
+        cmd_learned = int(c_stats.get("raids_learned", 0))
+        avg_rew = float(prof.get("ema_reward", c_stats.get("avg_reward", 0.70)))
+        min_r = float(prof.get("min_deploy_radius", 0.26))
+        sigma = float(prof.get("explore_sigma", 0.025))
+        order = prof.get("deploy_order") or c_stats.get("preferred_order") or []
+        short_order = "→".join(s.replace("troop_slot_", "S").replace("s_goblin", "Gob") for s in order[:4])
+
+        if hasattr(self, "brain_device_badge"):
+            self.brain_device_badge.config(
+                text=f"🧠 CoC Neural ({str(dev).upper()}) · {cmd_learned + raids_self} Ep · {mem_count} Mem"
+            )
+        if hasattr(self, "ai_telemetry_title"):
+            self.ai_telemetry_title.set(
+                f"🧠 Neural: Reward {avg_rew * 100:.0f}% · Memory: {mem_count} Base ({mem_recalls} Recall)"
+            )
+        if hasattr(self, "ai_telemetry_detail"):
+            self.ai_telemetry_detail.set(
+                f"Radius={min_r:.3f}  Sigma={sigma:.3f}  Order=[{short_order or 'default'}]"
+            )
 
     def _on_learn_from_video(self):
         if self.bot.is_running():
@@ -1408,10 +1696,11 @@ class BotGUI:
         self.log_text.config(state="normal")
         lower = str(text).lower()
         is_err = any(word in lower for word in ("error", "failed", "exception", "cannot"))
-        is_ok = any(word in lower for word in ("completed", "success", "stopped cleanly", "meets target"))
-        badge_tag = "error" if is_err else ("success" if is_ok else "info")
-        badge_txt = " ERR  " if is_err else (" OK   " if is_ok else " INFO ")
-        msg_tag = "msg_error" if is_err else ("msg_success" if is_ok else "")
+        is_ai = any(word in lower for word in ("self-learning", "deep learning", "brain ("))
+        is_ok = any(word in lower for word in ("completed", "success", "stopped cleanly", "meets target", "reinforce"))
+        badge_tag = "error" if is_err else ("ai" if is_ai else ("success" if is_ok else "info"))
+        badge_txt = " ERR  " if is_err else (" AI   " if is_ai else (" OK   " if is_ok else " INFO "))
+        msg_tag = "msg_error" if is_err else ("msg_ai" if is_ai else ("msg_success" if is_ok else ""))
 
         now_str = time.strftime("%H:%M:%S")
         self.log_text.insert(tk.END, f"{now_str} ", "time")
@@ -1486,6 +1775,16 @@ class BotGUI:
         except (ValueError, TypeError):
             return "0"
 
+    def _format_rate(self, amount: float, elapsed_s: float) -> str:
+        if elapsed_s < 15 or amount <= 0:
+            return "↑ Session gains"
+        per_hr = amount * (3600.0 / elapsed_s)
+        if per_hr >= 1_000_000:
+            return f"↑ {per_hr / 1_000_000:.1f}M / hr"
+        if per_hr >= 1_000:
+            return f"↑ {per_hr / 1_000:.0f}K / hr"
+        return f"↑ {per_hr:.0f} / hr"
+
     def _record_raid(self, raid):
         if not isinstance(raid, dict):
             return
@@ -1495,13 +1794,33 @@ class BotGUI:
         self.raids = self.raids[-100:]
         if row.get("status") in ("attacked", "skipped"):
             self.session_raid_count += 1
+        self._load_rl_history()
+        self._update_ai_mode_control()
         self._render_raids()
         self._refresh_metrics()
+        if self.chart_mode == "ai":
+            self._draw_performance()
 
     def _refresh_metrics(self):
+        elapsed = time.time() - self.started_at if self.started_at is not None else self.last_elapsed
+        seconds = int(max(0, elapsed))
+
         for key in ("gold", "elixir", "delixir"):
-            self.metric_vars[key].set(self._format_num(self.session_totals.get(key, 0)))
+            val = self.session_totals.get(key, 0)
+            self.metric_vars[key].set(self._format_num(val))
+            if hasattr(self, "metric_hint_vars") and key in self.metric_hint_vars:
+                self.metric_hint_vars[key].set(self._format_rate(val, elapsed))
+
         self.metric_vars["raids"].set(str(self.session_raid_count))
+        if hasattr(self, "metric_hint_vars") and "raids" in self.metric_hint_vars:
+            drains = [
+                float(r["drained"])
+                for r in self.raids[-30:]
+                if isinstance(r.get("drained"), (int, float))
+            ]
+            if drains:
+                self.metric_hint_vars["raids"].set(f"↑ Avg drain {sum(drains) / len(drains) * 100:.0f}%")
+
         try:
             goals = {
                 "gold": max(0, int(self.goal_gold.get())),
@@ -1517,8 +1836,6 @@ class BotGUI:
         except (tk.TclError, ValueError):
             self.metric_vars["progress"].set("—")
 
-        elapsed = time.time() - self.started_at if self.started_at is not None else self.last_elapsed
-        seconds = int(max(0, elapsed))
         self.metric_vars["runtime"].set(f"{seconds // 3600:02d}:{(seconds % 3600) // 60:02d}:{seconds % 60:02d}")
 
     def _render_raids(self):
@@ -1575,8 +1892,11 @@ class BotGUI:
             return
         try:
             frame = self.latest_frame
+            fh, fw = frame.shape[:2]
             image = Image.fromarray(frame[:, :, ::-1].copy())
             draw = ImageDraw.Draw(image)
+
+            # 1. Draw YOLO bounding boxes
             for name, items in (self.latest_detections or {}).items():
                 color = "#38bdf8" if "gold" not in name.lower() else "#fbbf24"
                 if "elixir" in name.lower():
@@ -1588,13 +1908,56 @@ class BotGUI:
                     x1, y1, x2, y2 = [int(v) for v in bbox]
                     draw.rectangle((x1, y1, x2, y2), outline=color, width=2)
                     draw.text((x1 + 3, max(0, y1 - 14)), f"{name} {float(item.get('confidence', 0) or 0):.2f}", fill=color)
+
+            # 2. Draw AI Tactical Radar Overlay (Perimeter Ring + Predicted Tap Targets + HUD)
+            if getattr(self, "show_ai_radar", True):
+                overlay = getattr(self, "latest_ai_overlay", None) or {}
+                planner = getattr(self.bot, "policy_planner", None)
+                prof = getattr(planner, "strategy_profile", {}) if planner else {}
+                min_r = float(overlay.get("min_radius") or prof.get("min_deploy_radius", 0.26))
+
+                # Draw Perimeter Safe-Ring around base center (0.50, 0.45)
+                cx, cy = int(fw * 0.50), int(fh * 0.45)
+                rx, ry = int(fw * min_r), int(fh * min_r)
+                draw.ellipse(
+                    (cx - rx, cy - ry, cx + rx, cy + ry),
+                    outline="#22d3ee",
+                    width=2,
+                )
+
+                # Draw AI Planned Tap Crosshairs
+                tap_pts = overlay.get("tap_points") or []
+                for px, py in tap_pts[:32]:
+                    ix, iy = int(px), int(py)
+                    draw.ellipse((ix - 7, iy - 7, ix + 7, iy + 7), outline="#22c55e", width=2)
+                    draw.line((ix - 10, iy, ix + 10, iy), fill="#22c55e", width=1)
+                    draw.line((ix, iy - 10, ix, iy + 10), fill="#22c55e", width=1)
+
+                # Draw AI Tactical HUD Banner on top-left if overlay telemetry exists
+                if overlay:
+                    pred_p = float(overlay.get("predicted_profit", 0.0) or 0.0)
+                    flank = str(overlay.get("side") or "all").upper()
+                    dead_tag = " · DEAD" if overlay.get("dead_base") else ""
+                    if overlay.get("memory_match"):
+                        m_sim = float(overlay.get("memory_similarity", 0.0) or 0.0) * 100.0
+                        m_act = "FIX" if overlay.get("memory_action") == "AVOID_MISTAKE" else "WIN"
+                        mem_tag = f"  |  MEM: {m_sim:.0f}% ({m_act})"
+                    else:
+                        mem_tag = f"  |  MEM: NEW ({int(overlay.get('memory_bank_size', 0))})"
+                    hud_txt = (
+                        f"AI BRAIN  |  PROFIT: {pred_p * 100:.0f}%  |  FLANK: {flank}"
+                        f"{mem_tag}  |  R={min_r:.3f}{dead_tag}"
+                    )
+                    draw.rectangle((14, 14, 595, 40), fill="#0f172a", outline="#38bdf8", width=1)
+                    draw.text((22, 20), hud_txt, fill="#38bdf8")
+
             width = max(320, self.preview_label.winfo_width() - 12)
             height = max(190, self.preview_label.winfo_height() - 12)
             image.thumbnail((width, height), Image.Resampling.LANCZOS)
             self._photo = ImageTk.PhotoImage(image)
             self.preview_label.config(image=self._photo, text="")
             self.preview_info.set(
-                f"{frame.shape[1]} × {frame.shape[0]}   ·   {self.game_screen.upper()}   ·   "
+                f"{fw} × {fh}   ·   {self.game_screen.upper()}   ·   "
                 f"Frame {time.strftime('%H:%M:%S', time.localtime(self._last_telemetry_at or time.time()))}"
             )
             self.live_badge.config(text="● LIVE", bg=self.GREEN_BG, fg=self.GREEN)
@@ -1631,6 +1994,55 @@ class BotGUI:
         height = max(90, canvas.winfo_height())
         left, right, top, bottom = 38, width - 12, 22, height - 18
 
+        if getattr(self, "chart_mode", "ai") == "ai" and getattr(self, "rl_history", None):
+            # Plot AI Online RL Self-Learning Curve (Reward % & Drain %)
+            legend_items = [
+                ("Reward %", "#a855f7"),
+                ("Drain %", self.CYAN),
+                ("Reinforce", self.GREEN),
+                ("Mistake Fix", self.GOLD),
+            ]
+            lx = left
+            for label, color in legend_items:
+                canvas.create_oval(lx, 6, lx + 7, 13, fill=color, outline=color)
+                canvas.create_text(
+                    lx + 10, 9, text=label, anchor="w", fill=self.MUTED, font=("Segoe UI", 7)
+                )
+                lx += 62
+
+            for i in range(4):
+                y = top + (bottom - top) * i / 3
+                canvas.create_line(left, y, right, y, fill="#192844")
+                val_pct = int(round(100 * (3 - i) / 3))
+                canvas.create_text(
+                    left - 5, y, text=f"{val_pct}%", anchor="e", fill=self.MUTED, font=("Segoe UI", 6)
+                )
+
+            samples = self.rl_history[-30:]
+            if len(samples) == 1:
+                samples = samples * 2
+            reward_pts = []
+            drain_pts = []
+            for idx, item in enumerate(samples):
+                x = left + (right - left) * idx / max(1, len(samples) - 1)
+                rew = max(0.0, min(1.0, float(item.get("reward", 0.0))))
+                drn = max(0.0, min(1.0, float(item.get("drain_ratio", 0.0))))
+                ry = bottom - rew * (bottom - top)
+                dy = bottom - drn * (bottom - top)
+                reward_pts.extend((x, ry))
+                drain_pts.extend((x, dy))
+
+            if len(drain_pts) >= 4:
+                canvas.create_line(*drain_pts, fill=self.CYAN, width=1)
+            if len(reward_pts) >= 4:
+                canvas.create_line(*reward_pts, fill="#a855f7", width=2)
+                for idx, item in enumerate(samples):
+                    px, py = reward_pts[idx * 2], reward_pts[idx * 2 + 1]
+                    dot_col = self.GOLD if item.get("is_mistake_correction") else self.GREEN
+                    canvas.create_oval(px - 3, py - 3, px + 3, py + 3, fill=dot_col, outline=dot_col)
+            return
+
+        # System Latency (ms) Graph
         legend_items = [
             ("Capture", self.CYAN),
             ("YOLO", self.ELIXIR),
@@ -1696,6 +2108,10 @@ class BotGUI:
         if msg.get("stage"):
             self.stage = str(msg["stage"])
             self.stage_var.set(self.stage)
+        if "ai_overlay" in msg:
+            incoming_ov = msg.get("ai_overlay") or {}
+            self.latest_ai_overlay.update(incoming_ov)
+            self._preview_needs_render = True
         if "detections" in msg:
             self.latest_detections = msg.get("detections") or {}
             self._render_detections()

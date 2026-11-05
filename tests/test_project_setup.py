@@ -297,6 +297,7 @@ class FarmingEnhancementsTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             cmd_weights = str(Path(temp_dir) / "coc_commander.pt")
+            mem_path = str(Path(temp_dir) / "base_memory.json")
             metrics = train_commander_from_data(
                 dataset_path=str(Path(temp_dir) / "nonexistent.jsonl"),
                 replay_dir=temp_dir,
@@ -306,7 +307,7 @@ class FarmingEnhancementsTests(unittest.TestCase):
             self.assertGreaterEqual(metrics["samples"], 10)
             self.assertTrue(Path(cmd_weights).is_file())
 
-            brain = CoCTacticalBrain(weights_path=cmd_weights)
+            brain = CoCTacticalBrain(weights_path=cmd_weights, memory_path=mem_path)
             self.assertTrue(brain.loaded)
 
             state = {
@@ -329,7 +330,7 @@ class FarmingEnhancementsTests(unittest.TestCase):
             self.assertIn(plan["target_side"], ("all", "left", "right"))
             self.assertGreaterEqual(plan["predicted_profit"], 0.5)
 
-            # Test mistake correction on poor raid outcome
+            # Test mistake correction on poor raid outcome + Associative Memory AVOID_MISTAKE recall
             rl_bad = brain.learn_from_raid(
                 state=state,
                 plan_used=plan,
@@ -340,16 +341,25 @@ class FarmingEnhancementsTests(unittest.TestCase):
             self.assertTrue(rl_bad["updated"])
             self.assertTrue(rl_bad["is_mistake"])
 
-            # Test reinforcement on high-loot raid outcome
+            plan_after_mistake = brain.plan(state)
+            self.assertTrue(plan_after_mistake["memory_match"])
+            self.assertEqual(plan_after_mistake["memory_action"], "AVOID_MISTAKE")
+            self.assertGreaterEqual(plan_after_mistake["memory_similarity"], 0.95)
+
+            # Test reinforcement on high-loot raid outcome + Associative Memory REINFORCE_WIN recall
             rl_good = brain.learn_from_raid(
                 state=state,
-                plan_used=plan,
+                plan_used=plan_after_mistake,
                 loot_gain={"gold": 820_000, "elixir": 800_000, "delixir": 4_900},
                 base_loot=state["loot"],
                 drained=0.95,
             )
             self.assertTrue(rl_good["updated"])
             self.assertFalse(rl_good["is_mistake"])
+
+            plan_after_win = brain.plan(state)
+            self.assertTrue(plan_after_win["memory_match"])
+            self.assertEqual(plan_after_win["memory_action"], "REINFORCE_WIN")
 
 
 if __name__ == "__main__":

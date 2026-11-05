@@ -436,14 +436,36 @@ class PolicyPlanner:
             Y_targets.append([target_dx, target_dy, float(rec.get("delay", 0.08))])
             sample_weights.append(weight)
 
+        # Experience Replay Buffer: mix current raid samples with historical memory
+        # to prevent Catastrophic Forgetting during long continuous farming sessions.
+        if not hasattr(self, "_replay_buffer"):
+            self._replay_buffer = []
+        replay_X = [item[0] for item in self._replay_buffer[-192:]]
+        replay_Y = [item[1] for item in self._replay_buffer[-192:]]
+        replay_W = [item[2] * 0.65 for item in self._replay_buffer[-192:]]
+
+        for fx, fy, fw in zip(X_rows, Y_targets, sample_weights):
+            self._replay_buffer.append((fx, fy, fw))
+        if len(self._replay_buffer) > 256:
+            self._replay_buffer = self._replay_buffer[-256:]
+
+        train_X = X_rows + replay_X
+        train_Y = Y_targets + replay_Y
+        train_W = sample_weights + replay_W
+
+        raids_so_far = int(self.strategy_profile.get("raids_self_learned", 0))
+        effective_lr = max(3e-4, float(lr) / (1.0 + 0.015 * raids_so_far))
+
         self.model.train()
-        X_t = torch.tensor(X_rows, dtype=torch.float32, device=self.device)
-        Y_t = torch.tensor(Y_targets, dtype=torch.float32, device=self.device)
+        X_t = torch.tensor(train_X, dtype=torch.float32, device=self.device)
+        Y_t = torch.tensor(train_Y, dtype=torch.float32, device=self.device)
         W_t = torch.tensor(
-            sample_weights, dtype=torch.float32, device=self.device
+            train_W, dtype=torch.float32, device=self.device
         ).unsqueeze(1)
 
-        optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=1e-4)
+        optimizer = torch.optim.AdamW(
+            self.model.parameters(), lr=effective_lr, weight_decay=1e-4
+        )
         initial_loss = 0.0
         final_loss = 0.0
         for step_i in range(max(1, int(steps))):
@@ -454,6 +476,7 @@ class PolicyPlanner:
             if step_i == 0:
                 initial_loss = float(loss.item())
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
             optimizer.step()
             final_loss = float(loss.item())
         self.model.eval()

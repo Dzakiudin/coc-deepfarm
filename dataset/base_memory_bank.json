@@ -1,0 +1,93 @@
+{
+  "total_recalls": 0,
+  "mistake_avoidances": 0,
+  "entries": [
+    {
+      "feats": [
+        1.7,
+        1.7,
+        3.0,
+        1.7,
+        1.0,
+        0.6113,
+        1.0,
+        0.625,
+        0.3125,
+        0.375,
+        0.625,
+        0.5,
+        0.6919,
+        0.125,
+        0.875,
+        1.0
+      ],
+      "reward": 0.92,
+      "drain": 0.95,
+      "used_side": "all",
+      "best_side": "all",
+      "best_style_idx": 0,
+      "best_timer": 106.7,
+      "is_mistake": false,
+      "hits": 1,
+      "ts": 1793902576.58
+    },
+    {
+      "feats": [
+        1.7,
+        1.7,
+        3.0,
+        1.7,
+        1.0,
+        0.5489,
+        0.6875,
+        0.3636,
+        0.4545,
+        0.1818,
+        0.8182,
+        0.6364,
+        0.5705,
+        0.0,
+        1.0,
+        1.0
+      ],
+      "reward": 0.92,
+      "drain": 0.95,
+      "used_side": "all",
+      "best_side": "all",
+      "best_style_idx": 0,
+      "best_timer": 92.9,
+      "is_mistake": false,
+      "hits": 1,
+      "ts": 1793902576.58
+    },
+    {
+      "feats": [
+        1.7,
+        1.7,
+        3.0,
+        1.7,
+        1.0,
+        0.489,
+        0.25,
+        0.5,
+        0.5,
+        0.5,
+        0.5,
+        0.0,
+        0.55,
+        0.5,
+        0.5,
+        1.0
+      ],
+      "reward": 0.92,
+      "drain": 0.95,
+      "used_side": "all",
+      "best_side": "all",
+      "best_style_idx": 0,
+      "best_timer": 171.1,
+      "is_mistake": false,
+      "hits": 1,
+      "ts": 1793902576.59
+    }
+  ]
+}

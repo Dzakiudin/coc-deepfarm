@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_COMMANDER_WEIGHTS = "models/coc_commander.pt"
 DEFAULT_SELF_LEARN_LOG = "dataset/self_learned_raids.jsonl"
+DEFAULT_BASE_MEMORY_PATH = "dataset/base_memory_bank.json"
 SIDE_CHOICES = ("all", "left", "right")
 
 
@@ -273,19 +274,289 @@ class RuleBrain(Brain):
             return {}
 
 
+class BaseMemoryBank:
+    """
+    Associative / Topological Base Memory (k-NN Cosine Similarity Vector Memory).
+    Remembers every base layout topology the bot has attacked, along with whether the
+    chosen strategy succeeded or failed:
+      - When scouting a new base, computes topological similarity against past bases.
+      - If a high-similarity twin base (>= 92%) is recalled:
+        * REINFORCE_WIN: Re-applies the proven flank, troop style, and timer that drained it.
+        * AVOID_MISTAKE: Actively blocks a flank/style that previously failed on this layout
+          and switches to the corrected strategy so the bot never repeats the same mistake.
+      - Consolidates near-identical layouts (>= 97.5% similarity) via Exponential Moving Average.
+    """
+
+    def __init__(self, memory_path: str | None = None, max_entries: int = 512):
+        self.memory_path = memory_path or user_path(DEFAULT_BASE_MEMORY_PATH)
+        self.max_entries = max_entries
+        self.entries: list[dict] = []
+        self.total_recalls = 0
+        self.mistake_avoidances = 0
+        self._load()
+
+    @staticmethod
+    def _topo_vector(feats: list[float]) -> np.ndarray:
+        """
+        Extract and weight the topological spatial features of a 16-dim base vector
+        so layout geometry (dead_base, avg_dist, flank fractions, outer ring, spread)
+        dominates similarity matching over raw loot amounts.
+        """
+        f = list(feats) + [0.0] * max(0, 16 - len(feats))
+        weights = np.array(
+            [
+                0.35,  # 0: gold_ratio
+                0.35,  # 1: elixir_ratio
+                0.20,  # 2: dark_ratio
+                0.40,  # 3: combo_ratio
+                1.40,  # 4: dead_base flag
+                1.60,  # 5: avg_dist from center
+                1.10,  # 6: store_count_norm
+                1.80,  # 7: left_frac
+                1.80,  # 8: right_frac
+                1.50,  # 9: top_frac
+                1.50,  # 10: bottom_frac
+                1.70,  # 11: outer_frac
+                1.30,  # 12: spread_std
+                0.80,  # 13: gold_frac
+                0.80,  # 14: elixir_frac
+                0.50,  # 15: meets_filter
+            ],
+            dtype=np.float32,
+        )
+        vec = np.array(f[:16], dtype=np.float32) * weights
+        norm = float(np.linalg.norm(vec))
+        return vec / norm if norm > 1e-6 else vec
+
+    def _load(self):
+        if os.path.isfile(self.memory_path):
+            try:
+                with open(self.memory_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    self.entries = list(data.get("entries") or [])
+                    self.total_recalls = int(data.get("total_recalls", 0))
+                    self.mistake_avoidances = int(data.get("mistake_avoidances", 0))
+                elif isinstance(data, list):
+                    self.entries = data
+                return
+            except Exception as e:
+                logger.debug(f"BaseMemoryBank load error: {e}")
+
+        # Seed initial topological memories from video demos & past raid logs if bank is new
+        self._seed_from_existing_datasets()
+
+    def _seed_from_existing_datasets(self):
+        demo_path = user_path("dataset/attack_demos.jsonl")
+        if os.path.isfile(demo_path):
+            try:
+                with open(demo_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        demo = json.loads(line)
+                        storages = demo.get("storages") or []
+                        order = demo.get("deploy_order") or []
+                        duration_s = float(demo.get("duration_s", 110.0) or 110.0)
+                        side = str(demo.get("target_side") or "all")
+                        style_idx = 1 if (order and order[0] == "s_goblin") else 0
+                        state = {
+                            "loot": {"gold": 850_000, "elixir": 850_000, "delixir": 6_000},
+                            "targets": {"gold": 500_000, "elixir": 500_000, "delixir": 2_000},
+                            "base": {"storages": storages, "dead_base": True},
+                            "attack": {"target_mode": "smart"},
+                        }
+                        feats = extract_base_features(state)
+                        self.remember(
+                            feats=feats,
+                            reward=0.92,
+                            drain=0.95,
+                            used_side=side,
+                            best_side=side,
+                            best_style_idx=style_idx,
+                            best_timer=duration_s,
+                            is_mistake=False,
+                            save_now=False,
+                        )
+            except Exception:
+                pass
+        if self.entries:
+            self.save()
+
+    def save(self):
+        try:
+            os.makedirs(os.path.dirname(self.memory_path), exist_ok=True)
+            with open(self.memory_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "total_recalls": self.total_recalls,
+                        "mistake_avoidances": self.mistake_avoidances,
+                        "entries": self.entries[-self.max_entries :],
+                    },
+                    f,
+                    indent=2,
+                )
+        except Exception as e:
+            logger.debug(f"BaseMemoryBank save failed: {e}")
+
+    def recall(self, feats: list[float], threshold: float = 0.92, top_k: int = 3) -> dict:
+        if not self.entries:
+            return {
+                "matched": False,
+                "similarity": 0.0,
+                "action": "NEW_LAYOUT",
+                "bank_size": 0,
+            }
+
+        q_vec = self._topo_vector(feats)
+        scored = []
+        for entry in self.entries:
+            ef = entry.get("feats")
+            if not ef or len(ef) < 16:
+                continue
+            e_vec = self._topo_vector(ef)
+            sim = float(np.dot(q_vec, e_vec))
+            scored.append((sim, entry))
+
+        if not scored:
+            return {
+                "matched": False,
+                "similarity": 0.0,
+                "action": "NEW_LAYOUT",
+                "bank_size": len(self.entries),
+            }
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        best_sim, best_entry = scored[0]
+        if best_sim < threshold:
+            return {
+                "matched": False,
+                "similarity": round(best_sim, 4),
+                "action": "NEW_LAYOUT",
+                "bank_size": len(self.entries),
+            }
+
+        neighbors = [item for item in scored[:top_k] if item[0] >= threshold]
+        weight_sum = sum(sim for sim, _ in neighbors) or 1.0
+        avg_profit = sum(sim * float(ent.get("reward", 0.7)) for sim, ent in neighbors) / weight_sum
+        avg_timer = sum(sim * float(ent.get("best_timer", 90.0)) for sim, ent in neighbors) / weight_sum
+
+        was_mistake = bool(best_entry.get("is_mistake", False))
+        action = "AVOID_MISTAKE" if was_mistake else "REINFORCE_WIN"
+        self.total_recalls += 1
+        if was_mistake:
+            self.mistake_avoidances += 1
+
+        return {
+            "matched": True,
+            "similarity": round(best_sim, 4),
+            "action": action,
+            "best_side": str(best_entry.get("best_side") or "all"),
+            "failed_side": str(best_entry.get("used_side") or "") if was_mistake else "",
+            "best_style_idx": int(best_entry.get("best_style_idx", 0)),
+            "best_timer": round(avg_timer, 1),
+            "expected_profit": round(avg_profit, 4),
+            "hits": int(best_entry.get("hits", 1)),
+            "bank_size": len(self.entries),
+        }
+
+    def remember(
+        self,
+        feats: list[float],
+        reward: float,
+        drain: float,
+        used_side: str,
+        best_side: str,
+        best_style_idx: int,
+        best_timer: float,
+        is_mistake: bool,
+        save_now: bool = True,
+    ) -> dict:
+        q_vec = self._topo_vector(feats)
+        best_idx = -1
+        best_sim = -1.0
+        for idx, entry in enumerate(self.entries):
+            ef = entry.get("feats")
+            if not ef or len(ef) < 16:
+                continue
+            sim = float(np.dot(q_vec, self._topo_vector(ef)))
+            if sim > best_sim:
+                best_sim = sim
+                best_idx = idx
+
+        now_ts = round(time.time(), 2)
+        if best_idx >= 0 and best_sim >= 0.975:
+            # Consolidate with existing memory of the same base topology
+            ent = self.entries[best_idx]
+            prev_rew = float(ent.get("reward", reward))
+            ent["feats"] = [
+                round(0.7 * float(a) + 0.3 * float(b), 4)
+                for a, b in zip(ent["feats"], feats)
+            ]
+            ent["reward"] = round(0.65 * prev_rew + 0.35 * float(reward), 4)
+            ent["drain"] = round(0.65 * float(ent.get("drain", drain)) + 0.35 * float(drain), 4)
+            ent["hits"] = int(ent.get("hits", 1)) + 1
+            ent["ts"] = now_ts
+            if not is_mistake and reward >= prev_rew - 0.05:
+                ent["best_side"] = best_side
+                ent["best_style_idx"] = int(best_style_idx)
+                ent["best_timer"] = round(float(best_timer), 1)
+                ent["is_mistake"] = False
+            elif is_mistake:
+                ent["used_side"] = used_side
+                ent["best_side"] = best_side
+                ent["best_style_idx"] = int(best_style_idx)
+                ent["best_timer"] = round(float(best_timer), 1)
+                ent["is_mistake"] = True
+            consolidated = True
+        else:
+            self.entries.append(
+                {
+                    "feats": [round(float(x), 4) for x in feats[:16]],
+                    "reward": round(float(reward), 4),
+                    "drain": round(float(drain), 4),
+                    "used_side": str(used_side),
+                    "best_side": str(best_side),
+                    "best_style_idx": int(best_style_idx),
+                    "best_timer": round(float(best_timer), 1),
+                    "is_mistake": bool(is_mistake),
+                    "hits": 1,
+                    "ts": now_ts,
+                }
+            )
+            if len(self.entries) > self.max_entries:
+                self.entries = self.entries[-self.max_entries :]
+            consolidated = False
+
+        if save_now:
+            self.save()
+        return {
+            "consolidated": consolidated,
+            "similarity": round(max(0.0, best_sim), 4),
+            "bank_size": len(self.entries),
+        }
+
+
 class CoCTacticalBrain(Brain):
     """
     100% Dedicated Clash of Clans Deep Learning Strategic Brain.
     Runs CoCCommanderNet on GPU (CUDA) in <1ms with zero external APIs or LLM overhead,
-    and continuously self-learns from every raid outcome.
+    backed by an Associative Base Memory Bank (k-NN topological recall) and Online RL.
     """
 
     name = "coc_ai"
 
-    def __init__(self, weights_path: str | None = None, device: str | None = None):
+    def __init__(
+        self,
+        weights_path: str | None = None,
+        device: str | None = None,
+        memory_path: str | None = None,
+    ):
         self.weights_path = weights_path or user_path(DEFAULT_COMMANDER_WEIGHTS)
         self.device = device or ("cuda:0" if torch.cuda.is_available() else "cpu")
         self.model = CoCCommanderNet().to(self.device)
+        self.memory_bank = BaseMemoryBank(memory_path=memory_path)
         self.enabled = True
         self.loaded = False
         self.last_error = ""
@@ -293,13 +564,30 @@ class CoCTacticalBrain(Brain):
             "raids_learned": 0,
             "avg_reward": 0.65,
             "preferred_order": [],
+            "memory_bank_size": len(self.memory_bank.entries),
+            "memory_recalls": self.memory_bank.total_recalls,
         }
+        self._replay_buffer: list[tuple] = []
         self._load_or_bootstrap()
+        self._seed_replay_from_memory()
+
+    def _seed_replay_from_memory(self):
+        for ent in self.memory_bank.entries[-128:]:
+            ef = ent.get("feats")
+            if not ef or len(ef) < 16:
+                continue
+            b_side = str(ent.get("best_side") or "all")
+            s_idx = SIDE_CHOICES.index(b_side) if b_side in SIDE_CHOICES else 0
+            st_idx = int(ent.get("best_style_idx", 0))
+            tm_norm = max(0.0, min(1.0, (float(ent.get("best_timer", 90.0)) - 45.0) / 95.0))
+            rew = float(ent.get("reward", 0.72))
+            self._replay_buffer.append((ef, [rew], s_idx, st_idx, [tm_norm]))
 
     def describe(self) -> str:
         return (
             f"CoCCommanderNet ({self.device}, "
-            f"raids_learned={self.stats.get('raids_learned', 0)})"
+            f"raids_learned={self.stats.get('raids_learned', 0)}, "
+            f"memory={len(self.memory_bank.entries)})"
         )
 
     def _load_or_bootstrap(self):
@@ -312,6 +600,7 @@ class CoCTacticalBrain(Brain):
                 self.model.load_state_dict(state_dict)
                 if isinstance(ckpt.get("stats"), dict):
                     self.stats.update(ckpt["stats"])
+                self.stats["memory_bank_size"] = len(self.memory_bank.entries)
                 self.model.eval()
                 self.loaded = True
                 return
@@ -327,12 +616,14 @@ class CoCTacticalBrain(Brain):
                 self.model.load_state_dict(ckpt.get("model_state", ckpt))
                 if isinstance(ckpt.get("stats"), dict):
                     self.stats.update(ckpt["stats"])
+                self.stats["memory_bank_size"] = len(self.memory_bank.entries)
                 self.model.eval()
                 self.loaded = True
         except Exception as e:
             logger.warning(f"CoCCommanderNet bootstrap failed: {e}")
 
     def reload(self) -> bool:
+        self.memory_bank._load()
         self._load_or_bootstrap()
         return self.loaded
 
@@ -363,6 +654,24 @@ class CoCTacticalBrain(Brain):
             side_idx = int(torch.argmax(side_logits[0]).item())
             style_idx = int(torch.argmax(style_logits[0]).item())
             raw_timer = 45.0 + float(timer_norm[0, 0].item()) * 95.0
+
+            # Query Associative Base Memory Bank for topological twin bases
+            mem = self.memory_bank.recall(feats)
+            if mem.get("matched"):
+                sim = float(mem.get("similarity", 0.0))
+                mem_weight = min(0.65, max(0.30, (sim - 0.85) * 3.5))
+                if mem.get("action") == "REINFORCE_WIN":
+                    pred_profit = (1.0 - mem_weight) * pred_profit + mem_weight * float(
+                        mem.get("expected_profit", pred_profit)
+                    )
+                mem_side = str(mem.get("best_side") or "all")
+                if mem_side in SIDE_CHOICES:
+                    side_idx = SIDE_CHOICES.index(mem_side)
+                style_idx = int(mem.get("best_style_idx", style_idx))
+                raw_timer = (1.0 - mem_weight) * raw_timer + mem_weight * float(
+                    mem.get("best_timer", raw_timer)
+                )
+                self.stats["memory_recalls"] = self.memory_bank.total_recalls
 
             loot = state.get("loot") or {}
             targets = state.get("targets") or {}
@@ -417,6 +726,10 @@ class CoCTacticalBrain(Brain):
                 "target_side": target_side,
                 "predicted_profit": round(pred_profit, 3),
                 "style_idx": style_idx,
+                "memory_match": bool(mem.get("matched", False)),
+                "memory_similarity": float(mem.get("similarity", 0.0)),
+                "memory_action": str(mem.get("action") or "NEW_LAYOUT"),
+                "memory_bank_size": int(mem.get("bank_size", len(self.memory_bank.entries))),
             }
         except Exception as e:
             self.last_error = str(e)
@@ -434,9 +747,10 @@ class CoCTacticalBrain(Brain):
         steps: int = 8,
     ) -> dict:
         """
-        Online Reinforcement Learning for the Macro Strategic Brain (CoCCommanderNet).
+        Online Reinforcement Learning + Associative Base Memory Consolidation
+        for the Macro Strategic Brain (CoCCommanderNet).
         Updates profit prediction, attack side selection, troop deployment doctrine,
-        and surrender timer directly from the completed raid's outcome.
+        surrender timer, and BaseMemoryBank directly from the completed raid's outcome.
         """
         try:
             feats = extract_base_features(state)
@@ -472,6 +786,8 @@ class CoCTacticalBrain(Brain):
                     target_side_idx = 0
                 target_style_idx = 1 - used_style_idx
 
+            best_side_str = SIDE_CHOICES[target_side_idx]
+
             # Optimal timer target: slightly faster if we drained 100%, longer if storages survived
             used_timer = float(plan_used.get("surrender_after_s", 90.0))
             if drain_val >= 0.90:
@@ -482,14 +798,40 @@ class CoCTacticalBrain(Brain):
                 opt_timer = used_timer
             target_timer_norm = max(0.0, min(1.0, (opt_timer - 45.0) / 95.0))
 
-            x_t = torch.tensor([feats], dtype=torch.float32, device=self.device)
-            y_profit = torch.tensor([[realized_reward]], dtype=torch.float32, device=self.device)
-            y_side = torch.tensor([target_side_idx], dtype=torch.long, device=self.device)
-            y_style = torch.tensor([target_style_idx], dtype=torch.long, device=self.device)
-            y_timer = torch.tensor([[target_timer_norm]], dtype=torch.float32, device=self.device)
+            # Store or consolidate this base layout in Associative Base Memory
+            mem_status = self.memory_bank.remember(
+                feats=feats,
+                reward=realized_reward,
+                drain=drain_val,
+                used_side=used_side,
+                best_side=best_side_str,
+                best_style_idx=target_style_idx,
+                best_timer=opt_timer,
+                is_mistake=is_mistake,
+            )
+
+            if not hasattr(self, "_replay_buffer"):
+                self._replay_buffer = []
+            self._replay_buffer.append(
+                (feats, [realized_reward], target_side_idx, target_style_idx, [target_timer_norm])
+            )
+            if len(self._replay_buffer) > 128:
+                self._replay_buffer = self._replay_buffer[-128:]
+
+            batch = self._replay_buffer[-64:]
+            x_t = torch.tensor([b[0] for b in batch], dtype=torch.float32, device=self.device)
+            y_profit = torch.tensor([b[1] for b in batch], dtype=torch.float32, device=self.device)
+            y_side = torch.tensor([b[2] for b in batch], dtype=torch.long, device=self.device)
+            y_style = torch.tensor([b[3] for b in batch], dtype=torch.long, device=self.device)
+            y_timer = torch.tensor([b[4] for b in batch], dtype=torch.float32, device=self.device)
+
+            raids_so_far = int(self.stats.get("raids_learned", 0))
+            effective_lr = max(2e-4, float(lr) / (1.0 + 0.01 * raids_so_far))
 
             self.model.train()
-            optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=1e-4)
+            optimizer = torch.optim.AdamW(
+                self.model.parameters(), lr=effective_lr, weight_decay=1e-4
+            )
             loss_val = 0.0
             for _ in range(max(1, int(steps))):
                 optimizer.zero_grad()
@@ -500,12 +842,15 @@ class CoCTacticalBrain(Brain):
                 loss_t = nn.functional.smooth_l1_loss(t_pred, y_timer)
                 loss = loss_p + 0.5 * loss_side + 0.5 * loss_style + 0.25 * loss_t
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
                 optimizer.step()
                 loss_val = float(loss.item())
             self.model.eval()
 
             self.stats["raids_learned"] = int(self.stats.get("raids_learned", 0)) + 1
             self.stats["avg_reward"] = round(0.82 * prev_avg + 0.18 * realized_reward, 4)
+            self.stats["memory_bank_size"] = len(self.memory_bank.entries)
+            self.stats["memory_recalls"] = self.memory_bank.total_recalls
             if not is_mistake and plan_used.get("deploy_order"):
                 self.stats["preferred_order"] = list(plan_used["deploy_order"])
 
@@ -523,6 +868,8 @@ class CoCTacticalBrain(Brain):
                 "reward": round(realized_reward, 3),
                 "loss": round(loss_val, 5),
                 "raids_learned": self.stats["raids_learned"],
+                "memory_consolidated": bool(mem_status.get("consolidated", False)),
+                "memory_bank_size": int(mem_status.get("bank_size", 0)),
             }
         except Exception as e:
             logger.warning(f"CoCTacticalBrain online learning failed: {e}")

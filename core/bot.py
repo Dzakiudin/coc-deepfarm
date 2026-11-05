@@ -306,7 +306,15 @@ class CocBot:
             self.msg_queue.put({"type": "totals", "data": totals})
 
     def _publish_dashboard(
-        self, frame=None, details=None, *, screen=None, stage=None, loot=None, raid=None
+        self,
+        frame=None,
+        details=None,
+        *,
+        screen=None,
+        stage=None,
+        loot=None,
+        raid=None,
+        ai_overlay=None,
     ):
         if self.msg_queue is None:
             return
@@ -332,6 +340,8 @@ class CocBot:
             payload["loot"] = dict(loot)
         if raid is not None:
             payload["raid"] = dict(raid)
+        if ai_overlay is not None:
+            payload["ai_overlay"] = dict(ai_overlay)
         if details is not None:
             payload["detections"] = {
                 name: [
@@ -1401,6 +1411,18 @@ class CocBot:
                     )
                 )
                 points = self._deploy_targets(current, side)
+                self._publish_dashboard(
+                    ai_overlay={
+                        "tap_points": list(points[:32]),
+                        "side": side,
+                        "wave": wave,
+                        "min_radius": float(
+                            getattr(self.policy_planner, "strategy_profile", {}).get(
+                                "min_deploy_radius", 0.26
+                            )
+                        ),
+                    }
+                )
                 self._log(
                     f"wave {wave}: {len(points)} ground target(s) from "
                     f"{store_count} store(s), {len(rows)} row(s)"
@@ -1737,11 +1759,43 @@ class CocBot:
                         alt_plan = {}
                         if self.ai_enabled and self.brain_alt is not None:
                             alt_plan = self.brain_alt.plan(state)
+                            mem_match = bool(alt_plan.get("memory_match", False))
+                            mem_sim = float(alt_plan.get("memory_similarity", 0.0))
+                            mem_act = str(alt_plan.get("memory_action") or "NEW_LAYOUT")
+                            mem_bank = int(alt_plan.get("memory_bank_size", 0))
+                            self._publish_dashboard(
+                                ai_overlay={
+                                    "predicted_profit": float(
+                                        alt_plan.get("predicted_profit", 0.0)
+                                    ),
+                                    "side": str(alt_plan.get("target_side") or "all"),
+                                    "timer": float(
+                                        alt_plan.get("surrender_after_s", 90.0)
+                                    ),
+                                    "dead_base": bool(
+                                        state.get("base", {}).get("dead_base", False)
+                                    ),
+                                    "min_radius": float(
+                                        getattr(
+                                            self.policy_planner, "strategy_profile", {}
+                                        ).get("min_deploy_radius", 0.26)
+                                    ),
+                                    "memory_match": mem_match,
+                                    "memory_similarity": mem_sim,
+                                    "memory_action": mem_act,
+                                    "memory_bank_size": mem_bank,
+                                }
+                            )
+                            mem_tag = (
+                                f" | memory={mem_act} ({mem_sim * 100:.0f}% match, bank={mem_bank})"
+                                if mem_match
+                                else f" | memory=NEW_LAYOUT (max_sim={mem_sim * 100:.0f}%, bank={mem_bank})"
+                            )
                             self._log(
                                 f"brain ({self.brain_alt.describe()}): "
                                 f"pred_profit={alt_plan.get('predicted_profit', 0) * 100:.0f}% | "
                                 f"side={alt_plan.get('target_side')} | "
-                                f"timer={alt_plan.get('surrender_after_s')}s"
+                                f"timer={alt_plan.get('surrender_after_s')}s{mem_tag}"
                             )
                         recorder = self.replay.start(state, plan)
                         recorder.event(
