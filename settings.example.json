@@ -1,7 +1,8 @@
 {
   "controls": {},
   "brain": {
-    "use_ai": false
+    "name": "coc_ai",
+    "use_ai": true
   },
   "notifications": {
     "enabled": false

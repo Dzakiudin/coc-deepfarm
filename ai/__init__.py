@@ -1,32 +1,28 @@
 from ai.brain import (
-    DEFAULT_FALLBACK_MODEL,
-    DEFAULT_LOCAL_MODEL,
-    DEFAULT_MODEL,
+    DEFAULT_COMMANDER_WEIGHTS,
     Brain,
-    GeminiBrain,
-    LocalLLMBrain,
+    CoCCommanderNet,
+    CoCTacticalBrain,
     RuleBrain,
     evaluate_loot_targets,
+    extract_base_features,
     infer_target_side,
-    normalize_model_name,
-    should_consult_ai,
+    train_commander_from_data,
 )
 from ai.policy_net import PolicyPlanner, train_policy_from_dataset
 from ai.video_learner import VideoAttackExtractor
 
 __all__ = [
     "Brain",
-    "DEFAULT_FALLBACK_MODEL",
-    "DEFAULT_LOCAL_MODEL",
-    "DEFAULT_MODEL",
-    "GeminiBrain",
-    "LocalLLMBrain",
+    "CoCCommanderNet",
+    "CoCTacticalBrain",
+    "DEFAULT_COMMANDER_WEIGHTS",
     "PolicyPlanner",
     "RuleBrain",
     "VideoAttackExtractor",
     "evaluate_loot_targets",
+    "extract_base_features",
     "infer_target_side",
-    "normalize_model_name",
-    "should_consult_ai",
+    "train_commander_from_data",
     "train_policy_from_dataset",
 ]

@@ -21,7 +21,7 @@ class SettingsTemplateTests(unittest.TestCase):
             ):
                 loaded = settings.load_settings()
 
-            self.assertEqual(loaded, {"controls": {}, "brain": {"use_ai": False}, "notifications": {"enabled": False}})
+            self.assertEqual(loaded, {"controls": {}, "brain": {"name": "coc_ai", "use_ai": True}, "notifications": {"enabled": False}})
             self.assertEqual(json.loads(settings_path.read_text(encoding="utf-8")), loaded)
 
     def test_existing_user_settings_are_not_overwritten(self):
@@ -175,16 +175,12 @@ class FarmingEnhancementsTests(unittest.TestCase):
         active_w2 = bot._filter_active_slots(["s_goblin", "troop_slot_1"], baseline, wave=2)
         self.assertEqual(active_w2, ["troop_slot_1"])
 
-    def test_flexible_loot_evaluation_and_ai_quota_prefilter(self):
+    def test_flexible_loot_evaluation_and_spatial_feature_extraction(self):
         from ai.brain import (
             evaluate_loot_targets,
+            extract_base_features,
             infer_target_side,
-            normalize_model_name,
-            should_consult_ai,
         )
-
-        self.assertEqual(normalize_model_name("gemini-3.5-flash"), "gemini-2.5-flash-lite")
-        self.assertEqual(normalize_model_name("gemini-3.8-flash"), "gemini-2.5-flash")
 
         targets = {"gold": 500_000, "elixir": 500_000, "delixir": 5_000}
         jackpot_gold = {"gold": 950_000, "elixir": 300_000, "delixir": 4_000}
@@ -192,25 +188,29 @@ class FarmingEnhancementsTests(unittest.TestCase):
         self.assertTrue(evaluate_loot_targets(jackpot_gold, targets, mode="or"))
         self.assertTrue(evaluate_loot_targets(jackpot_gold, targets, mode="smart"))
 
-        # Low-loot base should not burn Gemini API quota
-        low_state = {
-            "loot": {"gold": 80_000, "elixir": 90_000, "delixir": 100},
-            "targets": targets,
-            "base": {"dead_base": False},
-            "attack": {"target_mode": "smart"},
-        }
-        self.assertFalse(should_consult_ai(low_state))
-
         # Clustered left storages should infer 'left' side
         left_geom = {
             "storages": [
-                {"x": 0.25, "y": 0.3},
-                {"x": 0.30, "y": 0.4},
-                {"x": 0.35, "y": 0.5},
-                {"x": 0.40, "y": 0.6},
-            ]
+                {"x": 0.25, "y": 0.3, "type": "gold"},
+                {"x": 0.30, "y": 0.4, "type": "elixir"},
+                {"x": 0.35, "y": 0.5, "type": "gold"},
+                {"x": 0.40, "y": 0.6, "type": "elixir"},
+            ],
+            "dead_base": True,
         }
         self.assertEqual(infer_target_side(left_geom), "left")
+
+        feats = extract_base_features(
+            {
+                "loot": jackpot_gold,
+                "targets": targets,
+                "base": left_geom,
+                "attack": {"target_mode": "smart"},
+            }
+        )
+        self.assertEqual(len(feats), 16)
+        self.assertEqual(feats[4], 1.0)  # dead_base flag
+        self.assertEqual(feats[15], 1.0)  # meets_filter flag
 
     def test_video_learner_and_policy_net_behavioral_cloning_pipeline(self):
         from ai.policy_net import PolicyPlanner, train_policy_from_dataset
@@ -218,7 +218,6 @@ class FarmingEnhancementsTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             dataset_path = str(Path(temp_dir) / "attack_demos.jsonl")
-            llm_path = str(Path(temp_dir) / "llm_finetune.jsonl")
             weights_path = str(Path(temp_dir) / "attack_policy.pt")
 
             extractor = VideoAttackExtractor(
@@ -232,12 +231,9 @@ class FarmingEnhancementsTests(unittest.TestCase):
             f2[165:190, 285:310] = 255
 
             demo = extractor.extract_from_frames([f1, f2], fps=4.0)
-            extractor.save_demonstration(
-                demo, dataset_out=dataset_path, finetune_out=llm_path
-            )
+            extractor.save_demonstration(demo, dataset_out=dataset_path)
             self.assertGreaterEqual(len(demo["taps"]), 1)
             self.assertTrue(Path(dataset_path).is_file())
-            self.assertTrue(Path(llm_path).is_file())
 
             metrics = train_policy_from_dataset(
                 dataset_path=dataset_path,
@@ -249,67 +245,111 @@ class FarmingEnhancementsTests(unittest.TestCase):
 
             planner = PolicyPlanner(weights_path=weights_path)
             self.assertTrue(planner.loaded)
+            planner.start_raid_episode()
+            base_before = {"golds": [(800, 360)], "elixirs": [(600, 320)], "d_elixirs": []}
             pts = planner.predict_points(
-                {"golds": [(800, 360)], "elixirs": [(600, 320)], "d_elixirs": []},
+                base_before,
                 width=1680,
                 height=720,
                 side="all",
                 y_limit=590,
+                troop_slot="s_goblin",
             )
             self.assertTrue(len(pts) >= 2)
 
-    def test_local_llm_brain_parses_multimodal_json_response(self):
-        from ai.brain import LocalLLMBrain
-
-        captured_requests = []
-
-        class _FakeResp:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                return False
-
-            def read(self):
-                return json.dumps(
-                    {
-                        "response": json.dumps(
-                            {
-                                "skip_base": False,
-                                "deploy_order": ["s_goblin", "troop_slot_1"],
-                                "surrender_after_s": 55,
-                                "target_side": "right",
-                            }
-                        )
-                    }
-                ).encode("utf-8")
-
-        def fake_urlopen(req, timeout=None):
-            captured_requests.append(req)
-            return _FakeResp()
-
-        brain = LocalLLMBrain(
-            model="qwen2.5vl:3b",
-            vision=True,
-        )
-        dummy_frame = np.zeros((360, 640, 3), dtype=np.uint8)
-        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
-            plan = brain.plan(
-                {
-                    "loot": {"gold": 700_000, "elixir": 700_000, "delixir": 4_000},
-                    "targets": {"gold": 500_000, "elixir": 500_000, "delixir": 3_000},
-                    "base": {"storages": [{"type": "gold", "x": 0.72, "y": 0.45}]},
-                    "troop_slots": ["s_goblin", "troop_slot_1"],
-                    "attack": {"time_limit": 60.0},
-                },
-                frame=dummy_frame,
+            # Simulate a failed wave where neither storage was destroyed -> mistake correction
+            fb = planner.record_wave_feedback(base_before, base_before, 1680, 720)
+            self.assertGreaterEqual(fb["survived"], 2)
+            rl_mistake = planner.learn_from_raid_outcome(
+                loot_gain={"gold": 20_000, "elixir": 10_000, "delixir": 0},
+                base_loot={"gold": 800_000, "elixir": 800_000, "delixir": 0},
+                drained=0.05,
+                used_slots=["s_goblin", "troop_slot_1"],
             )
-        self.assertEqual(plan.get("target_side"), "right")
-        self.assertFalse(plan.get("skip_base"))
-        self.assertEqual(len(captured_requests), 1)
-        sent = json.loads(captured_requests[0].data.decode("utf-8"))
-        self.assertEqual(sent["model"], "qwen2.5vl:3b")
-        self.assertIn("images", sent)
+            self.assertTrue(rl_mistake["updated"])
+            self.assertTrue(rl_mistake["is_mistake"])
+
+            # Simulate a successful raid where storages are destroyed -> reinforcement
+            planner.start_raid_episode()
+            planner.predict_points(
+                base_before,
+                width=1680,
+                height=720,
+                side="all",
+                y_limit=590,
+                troop_slot="troop_slot_1",
+            )
+            fb_ok = planner.record_wave_feedback(
+                base_before, {"golds": [], "elixirs": [], "d_elixirs": []}, 1680, 720
+            )
+            self.assertGreaterEqual(fb_ok["destroyed"], 2)
+            rl_success = planner.learn_from_raid_outcome(
+                loot_gain={"gold": 780_000, "elixir": 760_000, "delixir": 0},
+                base_loot={"gold": 800_000, "elixir": 800_000, "delixir": 0},
+                drained=0.95,
+                used_slots=["troop_slot_1", "s_goblin"],
+            )
+            self.assertTrue(rl_success["updated"])
+            self.assertFalse(rl_success["is_mistake"])
+
+    def test_coc_tactical_brain_neural_planning_and_online_rl(self):
+        from ai.brain import CoCTacticalBrain, train_commander_from_data
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cmd_weights = str(Path(temp_dir) / "coc_commander.pt")
+            metrics = train_commander_from_data(
+                dataset_path=str(Path(temp_dir) / "nonexistent.jsonl"),
+                replay_dir=temp_dir,
+                weights_out=cmd_weights,
+                epochs=25,
+            )
+            self.assertGreaterEqual(metrics["samples"], 10)
+            self.assertTrue(Path(cmd_weights).is_file())
+
+            brain = CoCTacticalBrain(weights_path=cmd_weights)
+            self.assertTrue(brain.loaded)
+
+            state = {
+                "loot": {"gold": 850_000, "elixir": 820_000, "delixir": 5_000},
+                "targets": {"gold": 500_000, "elixir": 500_000, "delixir": 3_000},
+                "base": {
+                    "storages": [
+                        {"type": "gold", "x": 0.72, "y": 0.35},
+                        {"type": "elixir", "x": 0.78, "y": 0.45},
+                        {"type": "gold", "x": 0.75, "y": 0.55},
+                        {"type": "elixir", "x": 0.80, "y": 0.62},
+                    ],
+                    "dead_base": True,
+                },
+                "troop_slots": ["s_goblin", "troop_slot_1"],
+                "attack": {"time_limit": 90.0, "target_mode": "smart"},
+            }
+            plan = brain.plan(state)
+            self.assertFalse(plan["skip_base"])
+            self.assertIn(plan["target_side"], ("all", "left", "right"))
+            self.assertGreaterEqual(plan["predicted_profit"], 0.5)
+
+            # Test mistake correction on poor raid outcome
+            rl_bad = brain.learn_from_raid(
+                state=state,
+                plan_used=plan,
+                loot_gain={"gold": 40_000, "elixir": 30_000, "delixir": 0},
+                base_loot=state["loot"],
+                drained=0.10,
+            )
+            self.assertTrue(rl_bad["updated"])
+            self.assertTrue(rl_bad["is_mistake"])
+
+            # Test reinforcement on high-loot raid outcome
+            rl_good = brain.learn_from_raid(
+                state=state,
+                plan_used=plan,
+                loot_gain={"gold": 820_000, "elixir": 800_000, "delixir": 4_900},
+                base_loot=state["loot"],
+                drained=0.95,
+            )
+            self.assertTrue(rl_good["updated"])
+            self.assertFalse(rl_good["is_mistake"])
 
 
 if __name__ == "__main__":

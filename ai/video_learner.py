@@ -8,28 +8,30 @@ import time
 import cv2
 import numpy as np
 
-from ai.brain import SYSTEM_INSTRUCTION, infer_target_side
+from ai.brain import infer_target_side, train_commander_from_data
 from ai.policy_net import (
     DEFAULT_DATASET_PATH,
-    DEFAULT_POLICY_WEIGHTS,
     train_policy_from_dataset,
 )
 from core.utils import user_path
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_FINETUNE_PATH = "dataset/llm_finetune.jsonl"
-
 
 class VideoAttackExtractor:
     """
     Extracts human attack demonstrations from Clash of Clans gameplay videos (.mp4/.mkv/.avi)
     or frame sequences to train both:
-      1. AttackPolicyNet (Behavioral Cloning for human-like troop tap coordinates & timing)
-      2. Local LLM / VLM QLoRA instruction dataset (strategic deploy_order, target_side, duration)
+      1. AttackPolicyNet (Micro-tactical troop tap coordinates, perimeter projection & timing)
+      2. CoCCommanderNet (Macro-strategic side selection, troop sequence & dynamic timer)
     """
 
-    def __init__(self, vision=None, slot_names: list[str] | None = None):
+    def __init__(
+        self,
+        vision=None,
+        slot_names: list[str] | None = None,
+        controls: dict | None = None,
+    ):
         self.vision = vision
         self.slot_names = list(
             slot_names
@@ -42,6 +44,8 @@ class VideoAttackExtractor:
                 "troop_slot_5",
             ]
         )
+        self.controls = dict(controls or {})
+        self._active_slot = self.slot_names[0] if self.slot_names else "s_goblin"
 
     def _detect_storages(self, frame) -> list[dict]:
         h, w = frame.shape[:2]
@@ -103,27 +107,40 @@ class VideoAttackExtractor:
 
     def _detect_active_slot(self, prev_frame, curr_frame) -> str:
         h, w = curr_frame.shape[:2]
-        bar_y1, bar_y2 = int(h * 0.84), int(h * 0.96)
         n_slots = max(1, len(self.slot_names))
-        slot_x_start = int(w * 0.16)
-        slot_x_end = int(w * 0.56)
-        span = max(1, slot_x_end - slot_x_start)
+        best_slot = None
+        best_score = 0.0
 
-        best_idx = 0
-        best_score = -1.0
-        for idx in range(n_slots):
-            sx1 = slot_x_start + int(span * idx / n_slots)
-            sx2 = slot_x_start + int(span * (idx + 1) / n_slots)
-            patch_curr = curr_frame[bar_y1:bar_y2, sx1:sx2]
-            patch_prev = prev_frame[bar_y1:bar_y2, sx1:sx2]
+        for idx, slot_name in enumerate(self.slot_names):
+            norm = self.controls.get(slot_name)
+            if isinstance(norm, dict) and "x" in norm and "y" in norm:
+                cx = int(float(norm["x"]) * w)
+                cy = int(float(norm["y"]) * h)
+                sx1, sx2 = max(0, cx - int(w * 0.025)), min(w, cx + int(w * 0.025))
+                sy1, sy2 = max(0, cy - int(h * 0.055)), min(h, cy + int(h * 0.045))
+            else:
+                sy1, sy2 = int(h * 0.84), int(h * 0.96)
+                slot_x_start, slot_x_end = int(w * 0.16), int(w * 0.56)
+                span = max(1, slot_x_end - slot_x_start)
+                sx1 = slot_x_start + int(span * idx / n_slots)
+                sx2 = slot_x_start + int(span * (idx + 1) / n_slots)
+
+            patch_curr = curr_frame[sy1:sy2, sx1:sx2]
+            patch_prev = prev_frame[sy1:sy2, sx1:sx2]
             if patch_curr.size == 0 or patch_prev.size == 0:
+                continue
+            # Ignore grayscale (depleted) slots
+            hsv = cv2.cvtColor(patch_curr, cv2.COLOR_BGR2HSV)
+            if float(hsv[:, :, 1].mean()) < 26.0:
                 continue
             diff = float(np.mean(cv2.absdiff(patch_curr, patch_prev)))
             if diff > best_score:
                 best_score = diff
-                best_idx = idx
+                best_slot = slot_name
 
-        return self.slot_names[best_idx]
+        if best_slot is not None and best_score >= 6.5:
+            self._active_slot = best_slot
+        return self._active_slot
 
     @staticmethod
     def _detect_spawn_taps(prev_frame, curr_frame, existing_taps, t_sec: float) -> list[dict]:
@@ -160,7 +177,6 @@ class VideoAttackExtractor:
             nx = round((play_x1 + bx + bw / 2.0) / w, 4)
             ny = round((play_y1 + by + bh / 2.0) / h, 4)
 
-            # Deduplicate nearby recent taps ( prevents walking troops from registering as new taps )
             if any(
                 abs(t_sec - prev["t"]) < 1.2
                 and math.hypot(nx - prev["x"], ny - prev["y"]) < 0.065
@@ -178,9 +194,21 @@ class VideoAttackExtractor:
         if len(frames) < 2:
             raise ValueError("Need at least 2 frames to extract attack trajectory")
 
-        storages = self._detect_storages(frames[0])
+        storages = []
+        probe_indices = sorted(
+            {
+                min(len(frames) - 1, int(len(frames) * frac))
+                for frac in (0.0, 0.05, 0.12, 0.20, 0.30, 0.40)
+            }
+        )
+        for p_idx in probe_indices:
+            candidate = self._detect_storages(frames[p_idx])
+            if len(candidate) > len(storages):
+                storages = candidate
+            if len(storages) >= 10:
+                break
+
         if not storages:
-            # Default representative storage ring if frame has no visible storages
             storages = [
                 {"cls": "gold", "x": 0.35, "y": 0.35},
                 {"cls": "elixir", "x": 0.65, "y": 0.35},
@@ -246,7 +274,6 @@ class VideoAttackExtractor:
         video_path: str,
         sample_fps: float = 8.0,
         dataset_out: str | None = None,
-        finetune_out: str | None = None,
     ) -> dict:
         if not os.path.isfile(video_path):
             raise FileNotFoundError(f"Video file not found: {video_path}")
@@ -271,7 +298,7 @@ class VideoAttackExtractor:
                 if frame_idx % step == 0:
                     frames.append(frame)
                 frame_idx += 1
-                if len(frames) >= 1200:  # Cap at ~150s @ 8fps
+                if len(frames) >= 1200:
                     break
         finally:
             cap.release()
@@ -279,62 +306,30 @@ class VideoAttackExtractor:
         demo = self.extract_from_frames(
             frames, fps=effective_fps, source_name=os.path.basename(video_path)
         )
-        self.save_demonstration(demo, dataset_out=dataset_out, finetune_out=finetune_out)
+        self.save_demonstration(demo, dataset_out=dataset_out)
         return demo
 
     def save_demonstration(
         self,
         demo: dict,
         dataset_out: str | None = None,
-        finetune_out: str | None = None,
-    ) -> tuple[str, str]:
+    ) -> str:
         dataset_out = dataset_out or user_path(DEFAULT_DATASET_PATH)
-        finetune_out = finetune_out or user_path(DEFAULT_FINETUNE_PATH)
-
         os.makedirs(os.path.dirname(dataset_out), exist_ok=True)
-        os.makedirs(os.path.dirname(finetune_out), exist_ok=True)
-
         with open(dataset_out, "a", encoding="utf-8") as f:
             f.write(json.dumps(demo, ensure_ascii=False) + "\n")
-
-        # Also write an instruction-tuning sample for Local LLM QLoRA training (Unsloth / Ollama)
-        llm_state = {
-            "loot": {"gold": 650000, "elixir": 650000, "delixir": 4500},
-            "targets": {"gold": 400000, "elixir": 400000, "delixir": 2000},
-            "base": {"storages": demo.get("storages", [])},
-            "troop_slots": self.slot_names,
-        }
-        llm_target = {
-            "skip_base": False,
-            "deploy_order": demo.get("deploy_order", self.slot_names),
-            "surrender_after_s": demo.get("duration_s", 60.0),
-            "target_side": demo.get("target_side", "all"),
-        }
-        finetune_entry = {
-            "messages": [
-                {"role": "system", "content": SYSTEM_INSTRUCTION},
-                {"role": "user", "content": json.dumps(llm_state, ensure_ascii=False)},
-                {
-                    "role": "assistant",
-                    "content": json.dumps(llm_target, ensure_ascii=False),
-                },
-            ]
-        }
-        with open(finetune_out, "a", encoding="utf-8") as f:
-            f.write(json.dumps(finetune_entry, ensure_ascii=False) + "\n")
-
-        return dataset_out, finetune_out
+        return dataset_out
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="Extract human attack demonstrations from video (.mp4) and train Deep Learning AttackPolicyNet."
+        description="Extract human attack demonstrations from video (.mp4) and train CoC Deep Learning Networks."
     )
     parser.add_argument("--video", help="Path to attack gameplay video (.mp4/.mkv/.avi)")
     parser.add_argument(
         "--train",
         action="store_true",
-        help="Train AttackPolicyNet on dataset/attack_demos.jsonl after extraction",
+        help="Train AttackPolicyNet & CoCCommanderNet on dataset/attack_demos.jsonl",
     )
     parser.add_argument("--epochs", type=int, default=80, help="Training epochs")
     args = parser.parse_args(argv)
@@ -350,11 +345,18 @@ def main(argv=None):
 
     if args.train or args.video:
         metrics = train_policy_from_dataset(epochs=args.epochs)
+        cmd_metrics = train_commander_from_data(epochs=args.epochs)
         print(
             f"Trained AttackPolicyNet on {metrics['device']}: "
             f"{metrics['samples']} tap samples, "
             f"loss {metrics['initial_loss']} -> {metrics['final_loss']} "
             f"(saved to {metrics['weights_path']})"
+        )
+        print(
+            f"Trained CoCCommanderNet on {cmd_metrics['device']}: "
+            f"{cmd_metrics['samples']} strategic samples, "
+            f"loss {cmd_metrics['initial_loss']} -> {cmd_metrics['final_loss']} "
+            f"(saved to {cmd_metrics['weights_path']})"
         )
     return 0
 

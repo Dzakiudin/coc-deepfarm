@@ -10,6 +10,7 @@ from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageDraw, ImageTk
 import numpy as np
 
+from ai.brain import train_commander_from_data
 from ai.policy_net import train_policy_from_dataset
 from ai.video_learner import VideoAttackExtractor
 from core.settings import save_settings
@@ -1071,7 +1072,7 @@ class BotGUI:
         canvas.create_text(
             24,
             72,
-            text="Computer Vision   •   OCR   •   Automated Strategy   •   ADB Control   •   Optional Gemini AI",
+            text="Computer Vision   •   OCR   •   CoC Deep Learning Brain   •   Online Self-Learning RL   •   ADB Control",
             anchor="nw",
             fill="#94a3b8",
             font=("Segoe UI", 8),
@@ -1250,41 +1251,29 @@ class BotGUI:
     def _current_strategy_mode(self) -> str:
         if not bool(getattr(self.bot, "ai_enabled", False)):
             return "rule"
-        name = str(
-            getattr(self.bot, "brain_config", {}).get("name", "rule") or "rule"
-        ).strip().lower()
-        if name in ("local_llm", "ollama", "local"):
-            return "local_llm"
-        if name in ("gemini", "llm"):
-            return "gemini"
-        return "rule"
+        return "coc_ai"
 
     def _on_ai_mode_toggle(self):
-        order = ("rule", "local_llm", "gemini")
+        order = ("coc_ai", "rule")
         current = self._current_strategy_mode()
-        next_idx = (order.index(current) + 1) % len(order) if current in order else 0
-        for step in range(len(order)):
-            candidate_mode = order[(next_idx + step) % len(order)]
-            try:
-                if hasattr(self.bot, "set_strategy_mode"):
-                    self.bot.set_strategy_mode(candidate_mode)
-                else:
-                    self.bot.set_ai_enabled(candidate_mode != "rule")
-                candidate = dict(self.settings)
-                brain_settings = candidate.get("brain")
-                brain_settings = (
-                    dict(brain_settings) if isinstance(brain_settings, dict) else {}
-                )
-                brain_settings["name"] = candidate_mode
-                brain_settings["use_ai"] = candidate_mode != "rule"
-                candidate["brain"] = brain_settings
-                save_settings(candidate)
-                self.settings = candidate
-                break
-            except (OSError, RuntimeError) as exc:
-                if step == len(order) - 1:
-                    messagebox.showerror("Strategy mode", str(exc))
-                continue
+        candidate_mode = order[(order.index(current) + 1) % len(order)] if current in order else "coc_ai"
+        try:
+            if hasattr(self.bot, "set_strategy_mode"):
+                self.bot.set_strategy_mode(candidate_mode)
+            else:
+                self.bot.set_ai_enabled(candidate_mode != "rule")
+            candidate = dict(self.settings)
+            brain_settings = candidate.get("brain")
+            brain_settings = (
+                dict(brain_settings) if isinstance(brain_settings, dict) else {}
+            )
+            brain_settings["name"] = candidate_mode
+            brain_settings["use_ai"] = candidate_mode != "rule"
+            candidate["brain"] = brain_settings
+            save_settings(candidate)
+            self.settings = candidate
+        except (OSError, RuntimeError) as exc:
+            messagebox.showerror("Strategy mode", str(exc))
         self.ai_mode_var.set(bool(getattr(self.bot, "ai_enabled", False)))
         self._update_ai_mode_control()
 
@@ -1295,11 +1284,10 @@ class BotGUI:
         )
         suffix = " + PolicyNet" if policy_ready else ""
         labels = {
+            "coc_ai": f"CoC Deep AI (Commander{suffix})  ▾",
             "rule": f"Rule-based{suffix}  ▾",
-            "local_llm": f"Local AI (Ollama RTX){suffix}  ▾",
-            "gemini": f"Gemini Cloud AI{suffix}  ▾",
         }
-        self.ai_mode_text.set(labels.get(mode, labels["rule"]))
+        self.ai_mode_text.set(labels.get(mode, labels["coc_ai"]))
         running = self.bot_status in (
             "running", "farming", "loading", "starting", "stopping"
         )
@@ -1325,7 +1313,7 @@ class BotGUI:
         if not video_path:
             return
 
-        self.learn_video_btn.config(state="disabled", text="⏳ Training PolicyNet...")
+        self.learn_video_btn.config(state="disabled", text="⏳ Training CoC AI...")
         self._log(f"[Deep Learning] Extracting attack demonstrations from: {os.path.basename(video_path)}")
 
         def _worker():
@@ -1334,6 +1322,7 @@ class BotGUI:
                 extractor = VideoAttackExtractor(
                     vision=self.bot.vision,
                     slot_names=list(self.bot.troops.get("slots") or ["s_goblin"]),
+                    controls=self.bot.controls,
                 )
                 demo = extractor.extract_from_video(video_path, sample_fps=4.0)
                 self.msg_queue.put(
@@ -1346,15 +1335,18 @@ class BotGUI:
                     }
                 )
                 metrics = train_policy_from_dataset(epochs=60)
+                cmd_metrics = train_commander_from_data(epochs=80)
                 if getattr(self.bot, "policy_planner", None) is not None:
                     self.bot.policy_planner.reload()
+                if getattr(self.bot, "brain_alt", None) is not None and hasattr(self.bot.brain_alt, "reload"):
+                    self.bot.brain_alt.reload()
                 self.msg_queue.put(
                     {
                         "type": "log",
                         "text": (
-                            f"[Deep Learning] PolicyNet trained on {metrics['device']}! "
-                            f"Samples={metrics['samples']}, Loss={metrics['final_loss']:.4f}, "
-                            f"Saved to {os.path.basename(metrics['weights_path'])}"
+                            f"[Deep Learning] Trained CoCCommanderNet + PolicyNet on {metrics['device']}! "
+                            f"Samples={metrics['samples']}, PolicyLoss={metrics['final_loss']:.4f}, "
+                            f"CommanderLoss={cmd_metrics['final_loss']:.4f}"
                         ),
                     }
                 )

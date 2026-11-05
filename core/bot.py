@@ -9,14 +9,9 @@ import time
 import cv2
 
 from ai.brain import (
-    DEFAULT_FALLBACK_MODEL,
-    DEFAULT_LOCAL_MODEL,
-    DEFAULT_MODEL,
-    GeminiBrain,
-    LocalLLMBrain,
+    CoCTacticalBrain,
     RuleBrain,
     evaluate_loot_targets,
-    should_consult_ai,
 )
 from ai.policy_net import PolicyPlanner
 from core.config import AppConfig
@@ -251,31 +246,9 @@ class CocBot:
     def _init_alt_brain(self):
         self.brain_alt = None
         try:
-            name = str(self.brain_config.get("name") or "rule").strip().lower()
-            if name in ("local_llm", "ollama", "local"):
-                self.brain_alt = LocalLLMBrain(
-                    model=self.brain_config.get("local_model", DEFAULT_LOCAL_MODEL),
-                    endpoint=self.brain_config.get("ollama_endpoint") or None,
-                    timeout_s=float(self.brain_config.get("timeout_s", 12.0)),
-                    vision=bool(self.brain_config.get("vision", True)),
-                )
-            elif name in ("gemini", "llm"):
-                self.brain_alt = GeminiBrain(
-                    model=self.brain_config.get("model", DEFAULT_MODEL),
-                    api_key=self.brain_config.get("api_key") or None,
-                    api_key_env=self.brain_config.get(
-                        "api_key_env", "GEMINI_API_KEY"
-                    ),
-                    timeout_s=float(self.brain_config.get("timeout_s", 8.0)),
-                    endpoint=self.brain_config.get("endpoint") or None,
-                    thinking_level=self.brain_config.get("thinking_level", "low"),
-                    fallback_model=self.brain_config.get(
-                        "fallback_model", DEFAULT_FALLBACK_MODEL
-                    )
-                    or None,
-                )
+            self.brain_alt = CoCTacticalBrain()
         except Exception as e:
-            logger.warning(f"could not initialise alternate brain: {e}")
+            logger.warning(f"could not initialise CoCTacticalBrain: {e}")
 
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
@@ -283,47 +256,30 @@ class CocBot:
     def set_ai_enabled(self, enabled: bool):
         if self.is_running():
             raise RuntimeError("AI mode can only be changed while the bot is stopped.")
-        if enabled and (
-            self.brain_alt is None or not getattr(self.brain_alt, "enabled", False)
-        ):
-            raise RuntimeError(
-                "AI mode is unavailable. Configure a Gemini API key or switch to Local LLM."
-            )
+        if enabled and self.brain_alt is None:
+            self._init_alt_brain()
         self.ai_enabled = bool(enabled)
-        mode = "AI with rule fallback" if self.ai_enabled else "rule-based"
+        mode = "CoC Deep AI (CommanderNet + PolicyNet)" if self.ai_enabled else "Rule-based (+ PolicyNet)"
         self._log(f"strategy set to {mode}")
 
     def set_strategy_mode(self, mode: str):
         if self.is_running():
             raise RuntimeError("Strategy mode can only be changed while the bot is stopped.")
-        norm = str(mode or "rule").strip().lower()
+        norm = str(mode or "coc_ai").strip().lower()
         if norm == "rule":
             self.brain_config["name"] = "rule"
             self.brain_config["use_ai"] = False
             self.ai_enabled = False
-            self._log("strategy set to rule-based (+ PolicyNet if trained)")
+            self._log("strategy set to Rule-based (+ PolicyNet)")
             return
-        if norm in ("local_llm", "ollama"):
-            self.brain_config["name"] = "local_llm"
-            self.brain_config["use_ai"] = True
+        self.brain_config["name"] = "coc_ai"
+        self.brain_config["use_ai"] = True
+        if self.brain_alt is None:
             self._init_alt_brain()
-            self.ai_enabled = True
-            self._log(
-                f"strategy set to Local LLM ({self.brain_alt.describe() if self.brain_alt else 'ollama'})"
-            )
-            return
-        if norm == "gemini":
-            self.brain_config["name"] = "gemini"
-            self.brain_config["use_ai"] = True
-            self._init_alt_brain()
-            if self.brain_alt is None or not getattr(self.brain_alt, "enabled", False):
-                self.ai_enabled = False
-                raise RuntimeError(
-                    "Gemini AI mode requires a valid API key in settings.json or GEMINI_API_KEY."
-                )
-            self.ai_enabled = True
-            self._log(f"strategy set to {self.brain_alt.describe()}")
-            return
+        self.ai_enabled = True
+        self._log(
+            f"strategy set to CoC Deep AI ({self.brain_alt.describe() if self.brain_alt else 'CoCCommanderNet'})"
+        )
 
     def set_target_mode(self, mode: str):
         norm = str(mode or "and").strip().lower()
@@ -646,7 +602,13 @@ class CocBot:
                     f"[Smart-Click Warning] Button '{name}' NOT verified on screen within {timeout_s:g}s! Screen might be lagging/transitioning."
                 )
                 strict_verify = bool(self.waits.get("click_verify_strict", True))
-                if strict_verify:
+                # Never block critical exit/progression buttons (surr_conf, return_home, nxt_btn)
+                never_block = name in (
+                    self.config.SURR_CONF,
+                    self.config.RETURN_HOME,
+                    self.config.NXT_BTN,
+                )
+                if strict_verify and not never_block:
                     self._log(f"[Smart-Click Blocked] Refusing to tap unverified '{name}'")
                     return False
                 self._log(f"[Smart-Click Fallback] Falling back to calibrated coords ({calib_x}, {calib_y}) for {name}")
@@ -935,27 +897,47 @@ class CocBot:
                 for key in ("gold", "elixir", "delixir")
             },
         }
+        loot_dict = {
+            "gold": int(treasure.get(self.config.GOLD, 0)),
+            "elixir": int(treasure.get(self.config.ELIXIR, 0)),
+            "delixir": int(treasure.get(self.config.D_ELIXIR, 0)),
+        }
+        targets_dict = {
+            "gold": int(gtarget),
+            "elixir": int(etarget),
+            "delixir": int(detarget),
+        }
+        geom = self._base_geometry(base)
+        target_mode = str(self.attack.get("target_mode", "and"))
+        meets = evaluate_loot_targets(
+            loot_dict,
+            targets_dict,
+            mode=target_mode,
+            dead_base=bool(geom.get("dead_base", False)),
+        )
+        slots = self._deploy_slots()
+        learned_order = slots
+        learned_surrender = float(self.attack.get("time_limit", 90.0))
+        if getattr(self, "policy_planner", None) is not None and self.policy_planner.loaded:
+            learned_order = self.policy_planner.get_learned_deploy_order(slots)
+            learned_surrender = self.policy_planner.get_learned_surrender_s(learned_surrender)
+
         return {
-            "loot": {
-                "gold": int(treasure.get(self.config.GOLD, 0)),
-                "elixir": int(treasure.get(self.config.ELIXIR, 0)),
-                "delixir": int(treasure.get(self.config.D_ELIXIR, 0)),
-            },
-            "targets": {
-                "gold": int(gtarget),
-                "elixir": int(etarget),
-                "delixir": int(detarget),
-            },
+            "loot": loot_dict,
+            "targets": targets_dict,
+            "loot_meets_target": meets,
+            "learned_deploy_order": learned_order,
+            "learned_surrender_s": learned_surrender,
             "providers": self._provider_counts(base),
-            "base": self._base_geometry(base),
+            "base": geom,
             "history": history,
             "session": session,
-            "troop_slots": self._deploy_slots(),
+            "troop_slots": slots,
             "deploy_mode": self.troops.get("deploy_mode", "tap"),
             "attack": {
                 "drain_ratio": float(self.attack.get("drain_ratio", 0.8)),
                 "time_limit": float(self.attack.get("time_limit", 90.0)),
-                "target_mode": str(self.attack.get("target_mode", "and")),
+                "target_mode": target_mode,
             },
         }
 
@@ -1033,7 +1015,9 @@ class CocBot:
             return self._attack_rows(base, "all")
         return rows
 
-    def _deploy_targets(self, base: dict, side: str = "all") -> list:
+    def _deploy_targets(
+        self, base: dict, side: str = "all", troop_slot: str | None = None
+    ) -> list:
         limit = self._deploy_y_limit()
 
         left = self.window.win_left
@@ -1053,11 +1037,13 @@ class CocBot:
                 side=side,
                 y_limit=limit,
                 surrender_zone_fn=self._is_in_surrender_zone,
+                troop_slot=troop_slot,
             )
             if learned_pts:
-                self._log(
-                    f"PolicyNet generated {len(learned_pts)} human-learned target point(s)"
-                )
+                if troop_slot is None:
+                    self._log(
+                        f"PolicyNet generated {len(learned_pts)} human-learned perimeter target(s)"
+                    )
                 return learned_pts
 
         x_lo, x_hi = _SIDE_X_BOUNDS.get(side, _SIDE_X_BOUNDS["all"])
@@ -1258,15 +1244,21 @@ class CocBot:
                 active.append(slot)
                 continue
             if wave == 1:
-                if sat >= 32.0:
-                    baseline_sat[slot] = sat
+                if sat < 22.0:
+                    self._log(
+                        f"wave 1: slot '{slot}' is already grayscale/empty "
+                        f"(sat {sat:.1f}); skipping"
+                    )
+                    continue
+                baseline_sat[slot] = sat
                 active.append(slot)
             else:
                 base_s = baseline_sat.get(slot)
-                if base_s is not None and sat < max(20.0, base_s * 0.38):
+                thresh = max(25.0, base_s * 0.42) if base_s is not None else 26.0
+                if sat < thresh:
                     self._log(
                         f"wave {wave}: slot '{slot}' is depleted/grayscale "
-                        f"(sat {sat:.1f} vs initial {base_s:.1f}); skipping"
+                        f"(sat {sat:.1f} vs initial {base_s or 0:.1f}); skipping"
                     )
                 else:
                     active.append(slot)
@@ -1376,15 +1368,25 @@ class CocBot:
         started = None
         wave = 0
         remaining = total
+        prev_remaining = total
+        stagnant_waves = 0
         total_taps = 0
         total_holds = 0
-        slots = self._deploy_slots(plan.get("deploy_order"))
+        default_order = plan.get("deploy_order")
+        if (
+            getattr(self, "policy_planner", None) is not None
+            and self.policy_planner.loaded
+        ):
+            self.policy_planner.start_raid_episode()
+            default_order = self.policy_planner.get_learned_deploy_order(
+                self._deploy_slots(default_order)
+            )
+        slots = self._deploy_slots(default_order)
         baseline_sat = {}
         deploy_mode = self.troops.get("deploy_mode", "tap")
         if side != "all":
             self._log(f"deploy side: {side}")
-        if slots != self._deploy_slots():
-            self._log(f"deploy order (brain): {slots}")
+        self._log(f"deploy order: {slots}")
         while True:
             wave += 1
             rows = self._attack_rows(current, side)
@@ -1421,7 +1423,14 @@ class CocBot:
             active_slots = self._filter_active_slots(slots, baseline_sat, wave)
             if not active_slots:
                 self._log(
-                    f"wave {wave}: all troop slots depleted; waiting for deployed troops"
+                    f"wave {wave}: all troop slots depleted; monitoring battle until drain/timeout"
+                )
+                break
+
+            if wave >= 3 and len(active_slots) == 1 and stagnant_waves >= 1:
+                self._log(
+                    f"wave {wave}: only '{active_slots[0]}' remains with no further storage change; "
+                    "waiting for deployed troops on field"
                 )
                 break
 
@@ -1434,7 +1443,7 @@ class CocBot:
                 self._log(f"tap {slot} (deploy) at ({gx}, {gy})")
                 self.auto.click(gx, gy)
                 if not legacy:
-                    self._sleep(0.3, why="troop slot settle")
+                    self._sleep(0.25, why="troop slot settle")
                 if deploy_mode == "hold":
                     if self._stop_event.is_set():
                         break
@@ -1442,10 +1451,24 @@ class CocBot:
                     total_holds += holds_done
                     wave_actions += holds_done
                 elif deploy_mode == "target" and points:
-                    self.auto.tap_many(points)
-                    total_taps += len(points)
-                    wave_actions += len(points)
-                    if len(points) < 8 and rows:
+                    slot_pts = points
+                    if (
+                        getattr(self, "policy_planner", None) is not None
+                        and self.policy_planner.loaded
+                        and self.troops.get("use_policy_net", True)
+                    ):
+                        custom_pts = self._deploy_targets(
+                            current, side, troop_slot=slot
+                        )
+                        if custom_pts:
+                            budget = self.policy_planner.get_slot_tap_budget(
+                                slot, len(custom_pts), wave=wave
+                            )
+                            slot_pts = custom_pts[:budget]
+                    self.auto.tap_many(slot_pts)
+                    total_taps += len(slot_pts)
+                    wave_actions += len(slot_pts)
+                    if len(slot_pts) < 6 and rows and wave == 1:
                         swept = self._sweep_rows(rows, side)
                         total_taps += swept
                         wave_actions += swept
@@ -1454,7 +1477,7 @@ class CocBot:
                     total_taps += swept
                     wave_actions += swept
                 if slot_index < len(active_slots) - 1:
-                    self._sleep(0.2, why="troop slot switch")
+                    self._sleep(0.18, why="troop slot switch")
 
             if wave_actions == 0:
                 self._log(f"wave {wave}: 0 deployment actions executed; stopping waves")
@@ -1479,13 +1502,30 @@ class CocBot:
                 break
 
             try:
-                current = self._scan_base_layout()
+                next_base = self._scan_base_layout()
             except ScanFailed as e:
                 self._log(f"post-wave rescan failed ({e}); surrendering")
                 break
 
+            if (
+                getattr(self, "policy_planner", None) is not None
+                and self.policy_planner.loaded
+            ):
+                self.policy_planner.record_wave_feedback(
+                    current,
+                    next_base,
+                    self.window.win_width or 1,
+                    self.window.win_height or 1,
+                )
+            current = next_base
+
             counts = self._provider_counts(current)
             remaining = sum(counts.values())
+            if remaining >= prev_remaining:
+                stagnant_waves += 1
+            else:
+                stagnant_waves = 0
+            prev_remaining = remaining
             drained = 1.0 - (remaining / total)
             self._log(
                 f"wave {wave}: providers {remaining}/{total} remaining "
@@ -1495,6 +1535,12 @@ class CocBot:
                 self._log(
                     f"drain target reached ({drained * 100:.0f}% >= "
                     f"{drain_ratio * 100:.0f}%) after {wave} wave(s)"
+                )
+                break
+            if stagnant_waves >= 2:
+                self._log(
+                    f"wave {wave}: storage count unchanged for {stagnant_waves} waves; "
+                    "ending deployment loop"
                 )
                 break
 
@@ -1690,32 +1736,13 @@ class CocBot:
                         plan = self.brain.plan(state)
                         alt_plan = {}
                         if self.ai_enabled and self.brain_alt is not None:
-                            if should_consult_ai(state):
-                                if isinstance(self.brain_alt, LocalLLMBrain):
-                                    try:
-                                        scouting_frame = self.window.capture_window()
-                                    except Exception:
-                                        scouting_frame = None
-                                    alt_plan = self.brain_alt.plan(
-                                        state, frame=scouting_frame
-                                    )
-                                else:
-                                    alt_plan = self.brain_alt.plan(state)
-                                self._log(
-                                    f"brain alt ({self.brain_alt.describe()}): {alt_plan}"
-                                )
-                                if not alt_plan:
-                                    reason = getattr(
-                                        self.brain_alt, "last_error", ""
-                                    ) or "no plan"
-                                    self._log(
-                                        f"brain alt unavailable ({reason}); "
-                                        "rule plan for this raid"
-                                    )
-                            else:
-                                self._log(
-                                    "brain alt skipped (loot well below target; saving AI compute/quota)"
-                                )
+                            alt_plan = self.brain_alt.plan(state)
+                            self._log(
+                                f"brain ({self.brain_alt.describe()}): "
+                                f"pred_profit={alt_plan.get('predicted_profit', 0) * 100:.0f}% | "
+                                f"side={alt_plan.get('target_side')} | "
+                                f"timer={alt_plan.get('surrender_after_s')}s"
+                            )
                         recorder = self.replay.start(state, plan)
                         recorder.event(
                             "scan",
@@ -1727,7 +1754,6 @@ class CocBot:
                             recorder is not None
                             and self.ai_enabled
                             and self.brain_alt is not None
-                            and should_consult_ai(state)
                         ):
                             recorder.event(
                                 "plan_alt",
@@ -1737,7 +1763,8 @@ class CocBot:
                                     getattr(self.brain_alt, "last_error", "") or ""
                                 ),
                             )
-                        self._log(f"brain plan (rule): {plan}")
+                        if not self.ai_enabled:
+                            self._log(f"brain plan (rule): {plan}")
                     except Exception as e:
                         logger.warning(f"shadow brain/replay setup failed: {e}")
                         recorder = None
@@ -1757,14 +1784,6 @@ class CocBot:
                     elif plan:
                         active_plan = self._validate_plan(plan, state)
 
-                    brain_skip = bool(alt_plan.get("skip_base")) if alt_plan else False
-                    if brain_skip and self._brain_skip_streak >= _MAX_BRAIN_SKIP_STREAK:
-                        self._log(
-                            f"brain skipped {self._brain_skip_streak} bases in a "
-                            "row; attacking this one anyway"
-                        )
-                        brain_skip = False
-
                     target_mode = str(self.attack.get("target_mode", "and")).lower()
                     dead_base_flag = bool(
                         state.get("base", {}).get("dead_base", False)
@@ -1783,6 +1802,13 @@ class CocBot:
                         mode=target_mode,
                         dead_base=dead_base_flag,
                     )
+
+                    brain_skip = bool(alt_plan.get("skip_base")) if alt_plan else False
+                    if meets_targets and brain_skip:
+                        self._log(
+                            "brain alt suggested skip, but base meets loot filter; attacking!"
+                        )
+                        brain_skip = False
 
                     if meets_targets and not brain_skip:
                         self._brain_skip_streak = 0
@@ -1872,6 +1898,74 @@ class CocBot:
                                 drained=drained,
                                 attack=self._last_attack_stats,
                             )
+
+                        if (
+                            getattr(self, "policy_planner", None) is not None
+                            and self.policy_planner.loaded
+                        ):
+                            try:
+                                rl_res = self.policy_planner.learn_from_raid_outcome(
+                                    loot_gain={
+                                        "gold": g_gain,
+                                        "elixir": e_gain,
+                                        "delixir": de_gain,
+                                    },
+                                    base_loot={
+                                        "gold": current_gold,
+                                        "elixir": current_elixir,
+                                        "delixir": current_delixir,
+                                    },
+                                    drained=drained,
+                                    used_slots=(
+                                        active_plan.get("deploy_order")
+                                        if isinstance(active_plan, dict)
+                                        else None
+                                    ),
+                                )
+                                if rl_res.get("updated"):
+                                    mode_tag = (
+                                        "KOREKSI KESALAHAN"
+                                        if rl_res.get("is_mistake")
+                                        else "REINFORCE SUKSES"
+                                    )
+                                    self._log(
+                                        f"[Self-Learning PolicyNet] {mode_tag} | "
+                                        f"reward={rl_res.get('reward', 0):.2f} "
+                                        f"(baseline={rl_res.get('baseline', 0):.2f}) | "
+                                        f"loss={rl_res.get('loss', 0):.5f} | "
+                                        f"radius={rl_res.get('min_deploy_radius', 0):.3f}"
+                                    )
+                            except Exception as e:
+                                logger.warning(f"Policy online RL update failed: {e}")
+
+                        if (
+                            getattr(self, "brain_alt", None) is not None
+                            and hasattr(self.brain_alt, "learn_from_raid")
+                        ):
+                            try:
+                                cmd_rl = self.brain_alt.learn_from_raid(
+                                    state=state,
+                                    plan_used=active_plan if isinstance(active_plan, dict) else {},
+                                    loot_gain={
+                                        "gold": g_gain,
+                                        "elixir": e_gain,
+                                        "delixir": de_gain,
+                                    },
+                                    base_loot={
+                                        "gold": current_gold,
+                                        "elixir": current_elixir,
+                                        "delixir": current_delixir,
+                                    },
+                                    drained=drained,
+                                )
+                                if cmd_rl.get("updated"):
+                                    self._log(
+                                        f"[Self-Learning CommanderNet] "
+                                        f"raids_learned={cmd_rl.get('raids_learned', 0)} | "
+                                        f"loss={cmd_rl.get('loss', 0):.5f}"
+                                    )
+                            except Exception as e:
+                                logger.warning(f"Commander online RL update failed: {e}")
 
                         if drained is not None:
                             raid_drains.append(drained)
