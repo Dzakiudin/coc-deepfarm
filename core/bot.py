@@ -8,17 +8,28 @@ import time
 
 import cv2
 
-from brain import GeminiBrain, RuleBrain
-from config import AppConfig
-from notify import Notifier
-from replay import ReplayLogger
-from utils import user_path
+from ai.brain import (
+    DEFAULT_FALLBACK_MODEL,
+    DEFAULT_LOCAL_MODEL,
+    DEFAULT_MODEL,
+    GeminiBrain,
+    LocalLLMBrain,
+    RuleBrain,
+    evaluate_loot_targets,
+    should_consult_ai,
+)
+from ai.policy_net import PolicyPlanner
+from core.config import AppConfig
+from services.notify import Notifier
+from services.replay import ReplayLogger
+from perception.template_matcher import TemplateMatcher
+from core.utils import user_path
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_WAITS = {
     AppConfig.ATTACK_BTN_HOME: 0.5,
-    AppConfig.FIND_BTN: 0.5,
+    AppConfig.FIND_BTN: 1.0,
     AppConfig.NXT_BTN: 1.5,
     AppConfig.ATTACK_BTN: 0.5,
     AppConfig.SURR_BTN: 1.0,
@@ -75,6 +86,7 @@ DEFAULT_RECOVERY = {
 DEFAULT_ATTACK = {
     "drain_ratio": 0.8,
     "time_limit": 30.0,
+    "target_mode": "and",
 }
 
 DEFAULT_TROOPS = {
@@ -82,6 +94,7 @@ DEFAULT_TROOPS = {
     "deploy_mode": "tap",
     "hold_seconds": 0.6,
     "max_hold_points": 6,
+    "skip_empty_slots": True,
 }
 
 _SWEEP_STEP = 50
@@ -90,6 +103,9 @@ _SWEEP_RIGHT_MARGIN = 100
 _HOLD_LEFT_INSET = 0.08
 
 _ATTACK_ROW_MARGIN = 100
+_TROOP_BAR_MARGIN = 45
+_SURR_ZONE_PAD_X = 130
+_SURR_ZONE_PAD_Y = 75
 
 _ATTACK_ROW_TOLERANCE = 20
 
@@ -147,27 +163,14 @@ class CocBot:
         if self.troops.get("deploy_mode") not in ("tap", "hold", "target"):
             self.troops["deploy_mode"] = "tap"
         self.notifier = notifier or Notifier()
+        self.matcher = TemplateMatcher(template_dir=user_path("templates"))
         self.replay_config = dict(replay or {})
         self.brain_config = dict(brain or {})
         self.brain = RuleBrain()
         self.brain_alt = None
+        self.policy_planner = PolicyPlanner()
         self._side_requested = ""
-        try:
-            name = str(self.brain_config.get("name") or "rule").strip().lower()
-            if name in ("gemini", "llm"):
-                self.brain_alt = GeminiBrain(
-                    model=self.brain_config.get("model", "gemini-3.8-flash"),
-                    api_key=self.brain_config.get("api_key") or None,
-                    api_key_env=self.brain_config.get(
-                        "api_key_env", "GEMINI_API_KEY"
-                    ),
-                    timeout_s=float(self.brain_config.get("timeout_s", 8.0)),
-                    endpoint=self.brain_config.get("endpoint") or None,
-                        thinking_level=self.brain_config.get("thinking_level", "low"),
-                        fallback_model=self.brain_config.get("fallback_model") or None,
-                    )
-        except Exception as e:
-            logger.warning(f"could not initialise alternate brain: {e}")
+        self._init_alt_brain()
         self.ai_enabled = bool(
             self.brain_alt is not None
             and self.brain_alt.enabled
@@ -245,6 +248,35 @@ class CocBot:
         self._stop_event.set()
         self._set_status("stopping")
 
+    def _init_alt_brain(self):
+        self.brain_alt = None
+        try:
+            name = str(self.brain_config.get("name") or "rule").strip().lower()
+            if name in ("local_llm", "ollama", "local"):
+                self.brain_alt = LocalLLMBrain(
+                    model=self.brain_config.get("local_model", DEFAULT_LOCAL_MODEL),
+                    endpoint=self.brain_config.get("ollama_endpoint") or None,
+                    timeout_s=float(self.brain_config.get("timeout_s", 12.0)),
+                    vision=bool(self.brain_config.get("vision", True)),
+                )
+            elif name in ("gemini", "llm"):
+                self.brain_alt = GeminiBrain(
+                    model=self.brain_config.get("model", DEFAULT_MODEL),
+                    api_key=self.brain_config.get("api_key") or None,
+                    api_key_env=self.brain_config.get(
+                        "api_key_env", "GEMINI_API_KEY"
+                    ),
+                    timeout_s=float(self.brain_config.get("timeout_s", 8.0)),
+                    endpoint=self.brain_config.get("endpoint") or None,
+                    thinking_level=self.brain_config.get("thinking_level", "low"),
+                    fallback_model=self.brain_config.get(
+                        "fallback_model", DEFAULT_FALLBACK_MODEL
+                    )
+                    or None,
+                )
+        except Exception as e:
+            logger.warning(f"could not initialise alternate brain: {e}")
+
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
@@ -255,11 +287,50 @@ class CocBot:
             self.brain_alt is None or not getattr(self.brain_alt, "enabled", False)
         ):
             raise RuntimeError(
-                "AI mode is unavailable. Configure a Gemini API key and restart the app."
+                "AI mode is unavailable. Configure a Gemini API key or switch to Local LLM."
             )
         self.ai_enabled = bool(enabled)
         mode = "AI with rule fallback" if self.ai_enabled else "rule-based"
         self._log(f"strategy set to {mode}")
+
+    def set_strategy_mode(self, mode: str):
+        if self.is_running():
+            raise RuntimeError("Strategy mode can only be changed while the bot is stopped.")
+        norm = str(mode or "rule").strip().lower()
+        if norm == "rule":
+            self.brain_config["name"] = "rule"
+            self.brain_config["use_ai"] = False
+            self.ai_enabled = False
+            self._log("strategy set to rule-based (+ PolicyNet if trained)")
+            return
+        if norm in ("local_llm", "ollama"):
+            self.brain_config["name"] = "local_llm"
+            self.brain_config["use_ai"] = True
+            self._init_alt_brain()
+            self.ai_enabled = True
+            self._log(
+                f"strategy set to Local LLM ({self.brain_alt.describe() if self.brain_alt else 'ollama'})"
+            )
+            return
+        if norm == "gemini":
+            self.brain_config["name"] = "gemini"
+            self.brain_config["use_ai"] = True
+            self._init_alt_brain()
+            if self.brain_alt is None or not getattr(self.brain_alt, "enabled", False):
+                self.ai_enabled = False
+                raise RuntimeError(
+                    "Gemini AI mode requires a valid API key in settings.json or GEMINI_API_KEY."
+                )
+            self.ai_enabled = True
+            self._log(f"strategy set to {self.brain_alt.describe()}")
+            return
+
+    def set_target_mode(self, mode: str):
+        norm = str(mode or "and").strip().lower()
+        if norm not in ("and", "or", "smart"):
+            norm = "and"
+        self.attack["target_mode"] = norm
+        self._log(f"loot target evaluation mode set to '{norm}'")
 
     def _log(self, text: str):
         logger.info(text)
@@ -433,20 +504,163 @@ class CocBot:
             min(height - 1, max(0, int(ny * height))),
         )
 
-    def _press_button(self, name: str, wait_after: float | None = None):
+    def _check_and_dismiss_popups(self) -> bool:
+        """Dismiss accidental dialogs, Shop, or Pass screens if red 'X' close_btn is detected."""
+        if not hasattr(self, "matcher") or not self.matcher.has_template("close_btn"):
+            return False
+        frame = self.window.capture_window()
+        res = self.matcher.find_template(frame, "close_btn", threshold=0.70)
+        if res:
+            cx, cy = res["center"]
+            self._log(f"[Popup Dismiss] Accidental Shop/dialog popup detected! Tapping close_btn at ({cx}, {cy})")
+            self.auto.click(cx, cy)
+            self._sleep(1.0, why="waiting after dismissing popup")
+            return True
+        return False
+
+    def _check_and_tap_return_home(self) -> bool:
+        """If stuck on post-battle defeat/victory results screen, detect Return Home and tap it."""
+        frame = self.window.capture_window()
+        # 1. Try template matching
+        if hasattr(self, "matcher") and self.matcher.has_template("return_home"):
+            tpl_thresh = float(self.waits.get("template_match_threshold", 0.65))
+            res = self.matcher.find_template(frame, "return_home", threshold=tpl_thresh)
+            if res:
+                cx, cy = res["center"]
+                self._log(f"[Auto Return Home] Detected Return Home button at ({cx}, {cy}) via template! Tapping...")
+                self.auto.click(cx, cy)
+                return True
+        # 2. Try YOLO detection
+        details = self.vision.detect_with_details(frame, ["return_home"], conf=0.35)
+        if "return_home" in details and details["return_home"]:
+            best = details["return_home"][0]
+            cx, cy = int(best["center"][0]), int(best["center"][1])
+            self._log(f"[Auto Return Home] Detected Return Home button at ({cx}, {cy}) via YOLO! Tapping...")
+            self.auto.click(cx, cy)
+            return True
+        return False
+
+    def _press_button(self, name: str, wait_after: float | None = None, verify_visual: bool | None = None):
+        """
+        Press button with smart visual verification.
+        Priority:
+        1. Template Matching (Macro Recorder style reference image in templates/{name}.png)
+        2. YOLO Object Detection (AI model detection)
+        3. Calibrated coordinate fallback
+        """
         try:
-            x, y = self._button_coords(name)
+            calib_x, calib_y = self._button_coords(name)
         except KeyError:
             raise RuntimeError(f"'{name}' is not calibrated") from None
+
+        # Check if smart visual verification is requested/enabled
+        smart_enabled = self.waits.get("click_verify", True) if verify_visual is None else verify_visual
+
+        # YOLO classes known to represent buttons in models/best.pt
+        yolo_button_map = {
+            self.config.ATTACK_BTN_HOME: "attack_btn_home",
+            self.config.FIND_BTN: "find_btn",
+            self.config.ATTACK_BTN: "attack_btn",
+            self.config.NXT_BTN: "nxt_btn",
+            self.config.SURR_BTN: "end_btn",
+            self.config.SURR_CONF: "surr_conf",
+            self.config.RETURN_HOME: "return_home",
+            getattr(self.config, "S_GOBLIN", "s_goblin"): "s_goblin",
+        }
+
+        yolo_cls = yolo_button_map.get(name)
+        has_template = hasattr(self, "matcher") and self.matcher.has_template(name)
+        tap_x, tap_y = calib_x, calib_y
+
+        if smart_enabled and (has_template or yolo_cls):
+            timeout_s = float(self.waits.get("click_verify_timeout", 2.0))
+            poll_interval = 0.2
+            deadline = time.monotonic() + timeout_s
+            verified = False
+            match_source = ""
+            conf_val = 0.0
+
+            # ROI around calibrated coordinates for fast, focused search (300x300 box)
+            roi_w = max(240, int(self.window.win_width * 0.20))
+            roi_h = max(200, int(self.window.win_height * 0.25))
+            roi = (
+                max(0, calib_x - roi_w // 2),
+                max(0, calib_y - roi_h // 2),
+                roi_w,
+                roi_h,
+            )
+
+            while time.monotonic() <= deadline and not self._stop_event.is_set():
+                frame = self.window.capture_window()
+
+                # 1. Try Template Matching FIRST (highest precision pixel-level verification)
+                if has_template:
+                    tpl_thresh = float(self.waits.get("template_match_threshold", 0.75))
+                    res = self.matcher.find_template(
+                        frame, name, threshold=tpl_thresh, search_roi=roi
+                    )
+                    if not res:
+                        # Try full screen if not found in local ROI
+                        res = self.matcher.find_template(
+                            frame, name, threshold=tpl_thresh, search_roi=None
+                        )
+                    if res:
+                        tap_x, tap_y = res["center"]
+                        conf_val = res["confidence"]
+                        verified = True
+                        match_source = f"Template '{name}.png'"
+                        break
+
+                # 2. Try YOLO Detection if no template or template didn't match yet
+                if yolo_cls and not verified:
+                    conf_thresh = float(self.waits.get("click_verify_conf", 0.35))
+                    details = self.vision.detect_with_details(frame, [yolo_cls], conf=conf_thresh)
+
+                    if yolo_cls in details and details[yolo_cls]:
+                        candidates = details[yolo_cls]
+                        candidates.sort(
+                            key=lambda d: (d["center"][0] - calib_x) ** 2 + (d["center"][1] - calib_y) ** 2
+                        )
+                        best_det = candidates[0]
+                        det_x, det_y = int(best_det["center"][0]), int(best_det["center"][1])
+
+                        dist = ((det_x - calib_x) ** 2 + (det_y - calib_y) ** 2) ** 0.5
+                        max_tol = max(140, int(self.window.win_width * 0.15))
+                        if dist <= max_tol:
+                            tap_x, tap_y = det_x, det_y
+                            conf_val = float(best_det.get("confidence", 0))
+                            verified = True
+                            match_source = f"YOLO class '{yolo_cls}'"
+                            break
+
+                time.sleep(poll_interval)
+
+            if verified:
+                dist = ((tap_x - calib_x) ** 2 + (tap_y - calib_y) ** 2) ** 0.5
+                logger.info(
+                    f"Smart-click verified {name} via {match_source} at ({tap_x}, {tap_y}) "
+                    f"[dist={dist:.1f}px, score={conf_val:.2f}]"
+                )
+            else:
+                self._log(
+                    f"[Smart-Click Warning] Button '{name}' NOT verified on screen within {timeout_s:g}s! Screen might be lagging/transitioning."
+                )
+                strict_verify = bool(self.waits.get("click_verify_strict", True))
+                if strict_verify:
+                    self._log(f"[Smart-Click Blocked] Refusing to tap unverified '{name}'")
+                    return False
+                self._log(f"[Smart-Click Fallback] Falling back to calibrated coords ({calib_x}, {calib_y}) for {name}")
+
         norm = self.controls.get(name, {})
         wait = self.waits.get(name, DEFAULT_WAITS.get(name, 0.5)) if wait_after is None else wait_after
         self._log(
-            f"tap {name} at ({x}, {y})"
+            f"tap {name} at ({tap_x}, {tap_y})"
             f" [{norm.get('x', 0):.3f}, {norm.get('y', 0):.3f}]"
             f" frame {self.window.win_width}x{self.window.win_height} wait {wait:g}s"
         )
-        self.auto.click(x, y)
+        self.auto.click(tap_x, tap_y)
         self._sleep(wait)
+        return True
 
     def _detect_scan_details(self, frame, targets):
         details = self.vision.detect_with_details(frame, targets)
@@ -558,6 +772,7 @@ class CocBot:
         post_conf = max(0.3, min(self.config.conf, 0.35))
         summary_marker = self.config.RETURN_HOME
         best = {}
+        prev_best = None
         polls = 0
 
         while True:
@@ -569,6 +784,7 @@ class CocBot:
                 frame, targets + [summary_marker], conf=post_conf
             )
             polls += 1
+            snapshot_before = dict(best)
 
             kept = []
             rejected = set()
@@ -590,11 +806,14 @@ class CocBot:
                     if value > best.get(cls, 0):
                         best[cls] = value
 
-            logger.debug(f"post-game poll {polls}: {best}")
+            stable = prev_best is not None and best == snapshot_before
+            prev_best = dict(best)
+
+            logger.debug(f"post-game poll {polls}: {best} (stable={stable})")
             self._publish_dashboard(frame=frame, details=details, screen="post_battle", stage="Reading raid results", loot=best)
             self._dump_post_frame(frame, polls)
 
-            if all(best.get(cls, 0) > 0 for cls in targets):
+            if all(best.get(cls, 0) > 0 for cls in targets) and (stable or polls >= 2):
                 result = {cls: str(v) for cls, v in best.items()}
                 logger.debug(f"post-game loot read: {result} (after {polls} poll(s))")
                 return result
@@ -603,6 +822,7 @@ class CocBot:
                 details.get(summary_marker)
                 and any(v > 0 for v in best.values())
                 and not rejected
+                and (stable or polls >= 2)
             ):
                 result = {cls: str(v) for cls, v in best.items()}
                 logger.debug(
@@ -655,11 +875,12 @@ class CocBot:
             plan = dict(plan)
             plan["target_side"] = "all"
             side = "all"
+        else:
+            plan = dict(plan)
+            plan["target_side"] = side
         self._side_requested = side
         if side != "all":
-            self._log(f"brain asked for side {side}; deploying all sides")
-            plan = dict(plan)
-            plan["target_side"] = "all"
+            self._log(f"brain selected side '{side}' for focused initial wave")
         return plan
 
     def _base_geometry(self, base: dict) -> dict:
@@ -693,6 +914,15 @@ class CocBot:
                 "x2": max(xs),
                 "y2": max(ys),
             }
+            dists = [
+                math.hypot(s["x"] - 0.5, s["y"] - 0.46) for s in storages
+            ]
+            avg_dist = sum(dists) / len(dists)
+            geometry["avg_center_dist"] = round(avg_dist, 3)
+            geometry["dead_base"] = bool(len(storages) >= 4 and avg_dist >= 0.235)
+        else:
+            geometry["avg_center_dist"] = 0.0
+            geometry["dead_base"] = False
         return geometry
 
     def _build_raid_state(self, base: dict, treasure: dict, targets=None) -> dict:
@@ -725,6 +955,7 @@ class CocBot:
             "attack": {
                 "drain_ratio": float(self.attack.get("drain_ratio", 0.8)),
                 "time_limit": float(self.attack.get("time_limit", 90.0)),
+                "target_mode": str(self.attack.get("target_mode", "and")),
             },
         }
 
@@ -740,8 +971,47 @@ class CocBot:
             logger.debug(f"pre-surrender provider scan failed: {e}")
             return None
 
+    def _deploy_y_limit(self) -> int:
+        """
+        Compute the lowest safe Y coordinate for deploying troops without hitting the bottom troop bar.
+        When Surrender is in the bottom-left corner and troop slots sit lower down, allow deploying
+        down to above the troop bar while guarding the Surrender button with a 2D exclusion box.
+        """
+        height = self.window.win_height or 1
+        width = self.window.win_width or 1
+        try:
+            surr_x, surr_y = self._button_coords(self.config.SURR_BTN)
+        except Exception:
+            surr_x, surr_y = 0, self.window.win_top + height
+
+        slot_ys = []
+        for name in self._deploy_slots():
+            if name in self.controls:
+                try:
+                    _, sy = self._button_coords(name)
+                    slot_ys.append(sy)
+                except Exception:
+                    continue
+
+        if slot_ys and surr_x < width * 0.25 and min(slot_ys) > surr_y:
+            return max(surr_y - _ATTACK_ROW_MARGIN, min(slot_ys) - _TROOP_BAR_MARGIN)
+        return surr_y - _ATTACK_ROW_MARGIN
+
+    def _is_in_surrender_zone(self, x: float, y: float) -> bool:
+        """
+        Check whether (x, y) falls inside the bottom-left Surrender button safety zone.
+        """
+        try:
+            surr_x, surr_y = self._button_coords(self.config.SURR_BTN)
+        except Exception:
+            return False
+        return (
+            x <= surr_x + _SURR_ZONE_PAD_X
+            and y >= surr_y - _SURR_ZONE_PAD_Y
+        )
+
     def _attack_rows(self, base: dict, side: str = "all") -> list:
-        _, limit = self._button_coords(self.config.SURR_BTN)
+        limit = self._deploy_y_limit()
         y_lo, y_hi = _SIDE_Y_BOUNDS.get(side, _SIDE_Y_BOUNDS["all"])
         top = self.window.win_top
         height = self.window.win_height or 1
@@ -751,7 +1021,7 @@ class CocBot:
         for cls in (self.config.GOLDS, self.config.ELIXIRS, self.config.D_ELIXIRS):
             for item in base.get(cls, []):
                 y = item[1]
-                if y >= limit - _ATTACK_ROW_MARGIN:
+                if y >= limit:
                     continue
                 if side in ("top", "bottom") and not (y_min <= y <= y_max):
                     continue
@@ -764,16 +1034,32 @@ class CocBot:
         return rows
 
     def _deploy_targets(self, base: dict, side: str = "all") -> list:
-        try:
-            surr_y = self._button_coords(self.config.SURR_BTN)[1]
-        except Exception:
-            surr_y = self.window.win_top + (self.window.win_height or 1)
-        limit = surr_y - _ATTACK_ROW_MARGIN
+        limit = self._deploy_y_limit()
 
         left = self.window.win_left
         top = self.window.win_top
         width = self.window.win_width or 1
         height = self.window.win_height or 1
+
+        if (
+            getattr(self, "policy_planner", None) is not None
+            and self.policy_planner.loaded
+            and self.troops.get("use_policy_net", True)
+        ):
+            learned_pts = self.policy_planner.predict_points(
+                base,
+                width,
+                height,
+                side=side,
+                y_limit=limit,
+                surrender_zone_fn=self._is_in_surrender_zone,
+            )
+            if learned_pts:
+                self._log(
+                    f"PolicyNet generated {len(learned_pts)} human-learned target point(s)"
+                )
+                return learned_pts
+
         x_lo, x_hi = _SIDE_X_BOUNDS.get(side, _SIDE_X_BOUNDS["all"])
         y_lo, y_hi = _SIDE_Y_BOUNDS.get(side, _SIDE_Y_BOUNDS["all"])
         band_x_min = left + width * x_lo
@@ -805,7 +1091,7 @@ class CocBot:
 
         points = []
         for cx, cy in store_centres:
-            if cy >= limit:
+            if cy >= limit + _TARGET_RING_RADIUS:
                 continue
             if not (
                 band_x_min <= cx <= band_x_max
@@ -842,7 +1128,7 @@ class CocBot:
                     py = int(round(cy + dy * radius))
                     if not (safe_x_min <= px <= safe_x_max):
                         continue
-                    if py >= limit:
+                    if py >= limit or self._is_in_surrender_zone(px, py):
                         continue
                     if any(
                         (px - ox) ** 2 + (py - oy) ** 2 < keep_clear ** 2
@@ -869,6 +1155,8 @@ class CocBot:
         return points
 
     def _sweep_rows(self, rows: list, side: str = "all") -> int:
+        if not rows:
+            return 0
         started = time.time()
         total_taps = 0
         x_points = list(
@@ -892,7 +1180,11 @@ class CocBot:
                     f"deploy side {side} produced no x points; using full width"
                 )
         for k in rows:
-            points = [(a, k) for a in x_points]
+            points = [
+                (a, k) for a in x_points if not self._is_in_surrender_zone(a, k)
+            ]
+            if not points:
+                continue
             logger.debug(f"tap sweep row y={k}: {len(points)} taps")
             try:
                 self.auto.tap_many(points)
@@ -925,6 +1217,61 @@ class CocBot:
                 self._log(f"troop slot {name} not calibrated; skipping")
         return slots or [self.config.S_GOBLIN]
 
+    def _slot_saturation(self, frame, slot_name: str) -> float | None:
+        """
+        Measure mean HSV color saturation around a troop slot button.
+        In Clash of Clans, active troop icons are colorful (sat ~50-180),
+        whereas depleted (0 remaining) troop icons turn grayscale (sat < 20).
+        """
+        if frame is None or getattr(frame, "size", 0) == 0:
+            return None
+        try:
+            gx, gy = self._button_coords(slot_name)
+            fh, fw = frame.shape[:2]
+            half = 14
+            x1 = max(0, gx - half)
+            y1 = max(0, gy - half)
+            x2 = min(fw, gx + half)
+            y2 = min(fh, gy + half)
+            if x2 <= x1 or y2 <= y1:
+                return None
+            patch = frame[y1:y2, x1:x2]
+            hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+            return float(hsv[:, :, 1].mean())
+        except Exception:
+            return None
+
+    def _filter_active_slots(
+        self, slots: list, baseline_sat: dict, wave: int
+    ) -> list:
+        if not self.troops.get("skip_empty_slots", True):
+            return list(slots)
+        try:
+            frame = self.window.capture_window()
+        except Exception:
+            return list(slots)
+
+        active = []
+        for slot in slots:
+            sat = self._slot_saturation(frame, slot)
+            if sat is None:
+                active.append(slot)
+                continue
+            if wave == 1:
+                if sat >= 32.0:
+                    baseline_sat[slot] = sat
+                active.append(slot)
+            else:
+                base_s = baseline_sat.get(slot)
+                if base_s is not None and sat < max(20.0, base_s * 0.38):
+                    self._log(
+                        f"wave {wave}: slot '{slot}' is depleted/grayscale "
+                        f"(sat {sat:.1f} vs initial {base_s:.1f}); skipping"
+                    )
+                else:
+                    active.append(slot)
+        return active
+
     def _hold_rows(self, rows: list) -> int:
         try:
             hold_seconds = float(self.troops.get("hold_seconds", 0.6))
@@ -944,8 +1291,7 @@ class CocBot:
             )
             return 0
 
-        _, surr_y = self._button_coords(self.config.SURR_BTN)
-        limit = surr_y - _ATTACK_ROW_MARGIN
+        limit = self._deploy_y_limit()
         x_left = self.window.win_left + int(self.window.win_width * _HOLD_LEFT_INSET)
         x_right = self.window.win_width - _SWEEP_RIGHT_MARGIN
 
@@ -968,6 +1314,8 @@ class CocBot:
                     x = (x_left + x_right) // 2
                 else:
                     x = int(round(x_left + (x_right - x_left) * i / (count - 1)))
+                if self._is_in_surrender_zone(x, y):
+                    x = max(x, int(self.window.win_width * 0.22))
                 logger.debug(f"hold deploy at ({x}, {y}) for {hold_seconds:g}s")
                 try:
                     self.auto.hold(x, y, seconds=hold_seconds)
@@ -1031,6 +1379,7 @@ class CocBot:
         total_taps = 0
         total_holds = 0
         slots = self._deploy_slots(plan.get("deploy_order"))
+        baseline_sat = {}
         deploy_mode = self.troops.get("deploy_mode", "tap")
         if side != "all":
             self._log(f"deploy side: {side}")
@@ -1039,9 +1388,8 @@ class CocBot:
         while True:
             wave += 1
             rows = self._attack_rows(current, side)
-            self._log(f"wave {wave}: sweeping {len(rows)} row(s)")
             points = []
-            if deploy_mode == "target" and wave == 1:
+            if deploy_mode == "target":
                 store_count = sum(
                     len(current.get(cls, []))
                     for cls in (
@@ -1053,21 +1401,35 @@ class CocBot:
                 points = self._deploy_targets(current, side)
                 self._log(
                     f"wave {wave}: {len(points)} ground target(s) from "
-                    f"{store_count} store(s)"
+                    f"{store_count} store(s), {len(rows)} row(s)"
                 )
-                if len(points) < 20:
+                if len(points) < 8 and rows:
                     self._log(
                         f"wave {wave}: sparse target set ({len(points)}); "
                         "adding row sweep"
                     )
-            elif deploy_mode == "target":
+            else:
+                self._log(f"wave {wave}: sweeping {len(rows)} row(s)")
+
+            if not points and not rows:
                 self._log(
-                    f"wave {wave}: flood sweep {len(rows)} row(s)"
+                    f"wave {wave}: no reachable deployment rows or targets left; "
+                    "ending wave loop"
                 )
-            legacy = deploy_mode == "tap" and slots == [self.config.S_GOBLIN]
+                break
+
+            active_slots = self._filter_active_slots(slots, baseline_sat, wave)
+            if not active_slots:
+                self._log(
+                    f"wave {wave}: all troop slots depleted; waiting for deployed troops"
+                )
+                break
+
+            legacy = deploy_mode == "tap" and active_slots == [self.config.S_GOBLIN]
             if started is None:
                 started = time.time()
-            for slot_index, slot in enumerate(slots):
+            wave_actions = 0
+            for slot_index, slot in enumerate(active_slots):
                 gx, gy = self._button_coords(slot)
                 self._log(f"tap {slot} (deploy) at ({gx}, {gy})")
                 self.auto.click(gx, gy)
@@ -1076,16 +1438,27 @@ class CocBot:
                 if deploy_mode == "hold":
                     if self._stop_event.is_set():
                         break
-                    total_holds += self._hold_rows(rows)
-                elif deploy_mode == "target" and wave == 1 and points:
+                    holds_done = self._hold_rows(rows)
+                    total_holds += holds_done
+                    wave_actions += holds_done
+                elif deploy_mode == "target" and points:
                     self.auto.tap_many(points)
                     total_taps += len(points)
-                    if len(points) < 20:
-                        total_taps += self._sweep_rows(rows, side)
+                    wave_actions += len(points)
+                    if len(points) < 8 and rows:
+                        swept = self._sweep_rows(rows, side)
+                        total_taps += swept
+                        wave_actions += swept
                 else:
-                    total_taps += self._sweep_rows(rows, side)
-                if slot_index < len(slots) - 1:
+                    swept = self._sweep_rows(rows, side)
+                    total_taps += swept
+                    wave_actions += swept
+                if slot_index < len(active_slots) - 1:
                     self._sleep(0.2, why="troop slot switch")
+
+            if wave_actions == 0:
+                self._log(f"wave {wave}: 0 deployment actions executed; stopping waves")
+                break
 
             self._sleep(wave_settle, why="attack wave settle")
 
@@ -1208,6 +1581,14 @@ class CocBot:
                     )
                     break
 
+                # 1. If stuck on Defeat/Victory/Results screen, tap Return Home to get back to village
+                if self._check_and_tap_return_home():
+                    self._sleep(3.0, why="waiting for village transition clouds after Return Home")
+
+                # 2. Check and dismiss any unexpected Shop/popup blocking the village screen
+                self._check_and_dismiss_popups()
+
+                nav_ok = True
                 for btn in [
                     self.config.ATTACK_BTN_HOME,
                     self.config.FIND_BTN,
@@ -1215,7 +1596,25 @@ class CocBot:
                 ]:
                     if self._stop_event.is_set():
                         break
-                    self._press_button(btn)
+                    if not self._press_button(btn):
+                        # If blocked at home screen, check if still on Defeat/Results screen or blocked by popup
+                        if btn == self.config.ATTACK_BTN_HOME:
+                            if self._check_and_tap_return_home():
+                                self._sleep(3.0, why="waiting after Return Home tap")
+                                if self._press_button(btn):
+                                    continue
+                            if self._check_and_dismiss_popups():
+                                self._sleep(0.5)
+                                if self._press_button(btn):
+                                    continue
+                        self._log(f"[Navigation Guard] Cannot verify button '{btn}'. Halting phase to re-align.")
+                        nav_ok = False
+                        break
+
+                if self._stop_event.is_set() or not nav_ok:
+                    if not nav_ok:
+                        self._sleep(2.0, why="waiting after failed navigation button")
+                    continue
 
                 if self._stop_event.is_set():
                     break
@@ -1275,6 +1674,7 @@ class CocBot:
                     )
 
                     alt_plan = {}
+                    plan = {}
                     state = {}
                     try:
                         state = self._build_raid_state(
@@ -1282,20 +1682,39 @@ class CocBot:
                             base_treasure,
                             targets=(gtarget, etarget, detarget),
                         )
+                        if state.get("base", {}).get("dead_base"):
+                            self._log(
+                                f"dead-base collector layout detected "
+                                f"(avg_center_dist={state['base'].get('avg_center_dist', 0):.2f})"
+                            )
                         plan = self.brain.plan(state)
                         alt_plan = {}
                         if self.ai_enabled and self.brain_alt is not None:
-                            alt_plan = self.brain_alt.plan(state)
-                            self._log(
-                                f"brain alt ({self.brain_alt.describe()}): {alt_plan}"
-                            )
-                            if not alt_plan:
-                                reason = getattr(
-                                    self.brain_alt, "last_error", ""
-                                ) or "no plan"
+                            if should_consult_ai(state):
+                                if isinstance(self.brain_alt, LocalLLMBrain):
+                                    try:
+                                        scouting_frame = self.window.capture_window()
+                                    except Exception:
+                                        scouting_frame = None
+                                    alt_plan = self.brain_alt.plan(
+                                        state, frame=scouting_frame
+                                    )
+                                else:
+                                    alt_plan = self.brain_alt.plan(state)
                                 self._log(
-                                    f"brain alt unavailable ({reason}); "
-                                    "rule plan for this raid"
+                                    f"brain alt ({self.brain_alt.describe()}): {alt_plan}"
+                                )
+                                if not alt_plan:
+                                    reason = getattr(
+                                        self.brain_alt, "last_error", ""
+                                    ) or "no plan"
+                                    self._log(
+                                        f"brain alt unavailable ({reason}); "
+                                        "rule plan for this raid"
+                                    )
+                            else:
+                                self._log(
+                                    "brain alt skipped (loot well below target; saving AI compute/quota)"
                                 )
                         recorder = self.replay.start(state, plan)
                         recorder.event(
@@ -1308,6 +1727,7 @@ class CocBot:
                             recorder is not None
                             and self.ai_enabled
                             and self.brain_alt is not None
+                            and should_consult_ai(state)
                         ):
                             recorder.event(
                                 "plan_alt",
@@ -1334,8 +1754,10 @@ class CocBot:
                                 plan=active_plan,
                                 side_requested=self._side_requested,
                             )
+                    elif plan:
+                        active_plan = self._validate_plan(plan, state)
 
-                    brain_skip = bool(active_plan.get("skip_base"))
+                    brain_skip = bool(alt_plan.get("skip_base")) if alt_plan else False
                     if brain_skip and self._brain_skip_streak >= _MAX_BRAIN_SKIP_STREAK:
                         self._log(
                             f"brain skipped {self._brain_skip_streak} bases in a "
@@ -1343,20 +1765,44 @@ class CocBot:
                         )
                         brain_skip = False
 
-                    if (
-                        current_gold >= gtarget
-                        and current_delixir >= detarget
-                        and current_elixir >= etarget
-                        and not brain_skip
-                    ):
+                    target_mode = str(self.attack.get("target_mode", "and")).lower()
+                    dead_base_flag = bool(
+                        state.get("base", {}).get("dead_base", False)
+                    )
+                    meets_targets = evaluate_loot_targets(
+                        {
+                            "gold": current_gold,
+                            "elixir": current_elixir,
+                            "delixir": current_delixir,
+                        },
+                        {
+                            "gold": gtarget,
+                            "elixir": etarget,
+                            "delixir": detarget,
+                        },
+                        mode=target_mode,
+                        dead_base=dead_base_flag,
+                    )
+
+                    if meets_targets and not brain_skip:
                         self._brain_skip_streak = 0
                         self._publish_dashboard(screen="battle", stage="Executing raid")
                         if recorder is not None:
                             recorder.event("attack_start")
                         drained = self._initiate_attack(base, active_plan)
 
-                        self._press_button(self.config.SURR_BTN)
-                        self._press_button(self.config.SURR_CONF)
+                        # Check if battle already ended (Return Home button already visible)
+                        battle_already_ended = False
+                        if hasattr(self, "matcher") and self.matcher.has_template("return_home"):
+                            chk_frame = self.window.capture_window()
+                            if self.matcher.find_template(chk_frame, "return_home", threshold=0.70):
+                                battle_already_ended = True
+
+                        if battle_already_ended:
+                            self._log("Battle already ended naturally (Return Home visible); skipping surrender.")
+                        else:
+                            if self._press_button(self.config.SURR_BTN):
+                                self._press_button(self.config.SURR_CONF)
 
                         post_game = self._scan_post_game(
                             base_loot={
@@ -1472,6 +1918,7 @@ class CocBot:
                             zero_loot_streak = 0
 
                         self._press_button(self.config.RETURN_HOME)
+                        self._sleep(2.5, why="waiting for village transition clouds to clear")
 
                         if zero_loot_streak >= scan_limit:
                             mins = (time.time() - st_time) // 60

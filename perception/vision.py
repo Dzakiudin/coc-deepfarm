@@ -4,7 +4,7 @@ import time
 
 import cv2
 
-from utils import bundle_dir, configure_runtime_env
+from core.utils import bundle_dir, configure_runtime_env
 
 logger = logging.getLogger(__name__)
 
@@ -176,6 +176,48 @@ class VisionManager:
             )
         return cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
 
+    def _preprocess_high_contrast(self, region):
+        """
+        Isolate bright white Clash of Clans digits from dark outlines and background UI icons.
+        """
+        gray = self._preprocess(region)
+        _, thresh = cv2.threshold(gray, 195, 255, cv2.THRESH_BINARY)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        cleaned = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+        return cv2.copyMakeBorder(
+            cleaned, 8, 8, 8, 8, cv2.BORDER_CONSTANT, value=0
+        )
+
+    @staticmethod
+    def _extract_digits_from_ocr(ocr_result):
+        parts = []
+        dropped = []
+        for item in ocr_result or []:
+            text = (
+                str(item[1]).strip()
+                if isinstance(item, (list, tuple)) and len(item) > 1
+                else str(item).strip()
+            )
+            if not text:
+                continue
+            compact = text.replace(" ", "")
+            digits = sum(ch.isdigit() for ch in compact)
+            if digits and digits / len(compact) >= 0.55:
+                parts.append(text)
+            else:
+                digit_run = "".join(
+                    ch
+                    for ch in compact
+                    if ch.isdigit() or ch.lower() in _SUFFIX_MULTIPLIERS
+                )
+                only_digits = "".join(ch for ch in digit_run if ch.isdigit())
+                if len(only_digits) >= 3:
+                    parts.append(digit_run)
+                else:
+                    dropped.append(text)
+        raw = " ".join(parts)
+        return raw, dropped, parse_loot_number(raw)
+
     def read_number(self, frame, bbox):
         started = time.perf_counter()
         try:
@@ -196,21 +238,23 @@ class VisionManager:
         ocr_result = self.reader.readtext(
             self._preprocess(region), detail=1, allowlist=_OCR_ALLOWLIST
         )
+        raw, dropped, value = self._extract_digits_from_ocr(ocr_result)
 
-        parts = []
-        dropped = []
-        for item in ocr_result or []:
-            text = str(item[1]).strip()
-            if not text:
-                continue
-            digits = sum(ch.isdigit() for ch in text)
-            if digits and digits / len(text.replace(" ", "")) >= 0.6:
-                parts.append(text)
-            else:
-                dropped.append(text)
+        if value == "0":
+            hc_result = self.reader.readtext(
+                self._preprocess_high_contrast(region),
+                detail=1,
+                allowlist=_OCR_ALLOWLIST,
+            )
+            hc_raw, hc_dropped, hc_value = self._extract_digits_from_ocr(hc_result)
+            if hc_value != "0":
+                logger.debug(
+                    f"OCR high-contrast rescue bbox={(x1, y1, x2, y2)} "
+                    f"raw={hc_raw!r} -> {hc_value}"
+                )
+                return hc_value
+            dropped = dropped + hc_dropped
 
-        raw = " ".join(parts)
-        value = parse_loot_number(raw)
         logger.debug(
             f"OCR bbox={(x1, y1, x2, y2)} raw={raw!r} dropped={dropped!r} "
             f"-> {value}"

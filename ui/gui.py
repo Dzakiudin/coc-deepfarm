@@ -5,13 +5,15 @@ import queue
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import filedialog, messagebox, ttk
 
 from PIL import Image, ImageDraw, ImageTk
 import numpy as np
 
-from settings import save_settings
-from utils import user_path
+from ai.policy_net import train_policy_from_dataset
+from ai.video_learner import VideoAttackExtractor
+from core.settings import save_settings
+from core.utils import user_path
 
 
 class BotGUI:
@@ -594,8 +596,8 @@ class BotGUI:
 
         control_inner.grid_columnconfigure(0, weight=1)
 
-        self.min_gold = tk.IntVar(value=500000)
-        self.min_elixir = tk.IntVar(value=500000)
+        self.min_gold = tk.IntVar(value=1000000)
+        self.min_elixir = tk.IntVar(value=1000000)
         self.min_dark = tk.IntVar(value=0)
         self.goal_gold = tk.IntVar(value=20000000)
         self.goal_elixir = tk.IntVar(value=20000000)
@@ -665,6 +667,66 @@ class BotGUI:
         )
         self.ai_mode_btn.grid(row=0, column=1, sticky="ew")
         self._update_ai_mode_control()
+
+        self._label(
+            strategy_box,
+            "Loot Filter",
+            size=9,
+            color=self.MUTED,
+            bold=True,
+        ).grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
+        initial_tmode = str(
+            getattr(self.bot, "attack", {}).get("target_mode", "smart")
+        ).lower()
+        if initial_tmode not in ("and", "or", "smart"):
+            initial_tmode = "smart"
+        self.target_mode_var = tk.StringVar(value=initial_tmode)
+        self.target_mode_text = tk.StringVar()
+        self.target_mode_btn = tk.Button(
+            strategy_box,
+            textvariable=self.target_mode_text,
+            command=self._on_target_mode_cycle,
+            bg="#0b1324",
+            activebackground=self.PANEL2,
+            fg=self.TEXT,
+            activeforeground=self.TEXT,
+            relief="flat",
+            bd=1,
+            highlightbackground=self.BORDER,
+            highlightthickness=1,
+            padx=8,
+            pady=5,
+            font=("Segoe UI", 8, "bold"),
+            cursor="hand2",
+        )
+        self.target_mode_btn.grid(row=1, column=1, sticky="ew", pady=(6, 0))
+        self._update_target_mode_control()
+
+        self._label(
+            strategy_box,
+            "Video AI",
+            size=9,
+            color=self.MUTED,
+            bold=True,
+        ).grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
+        self.learn_video_btn = tk.Button(
+            strategy_box,
+            text="🎬 Learn Attack (.mp4)",
+            command=self._on_learn_from_video,
+            bg="#1e1b4b",
+            activebackground="#312e81",
+            fg="#c4b5fd",
+            activeforeground="#ffffff",
+            relief="flat",
+            bd=1,
+            highlightbackground="#4c1d95",
+            highlightthickness=1,
+            padx=8,
+            pady=5,
+            font=("Segoe UI", 8, "bold"),
+            cursor="hand2",
+        )
+        self.learn_video_btn.grid(row=2, column=1, sticky="ew", pady=(6, 0))
 
         controls = tk.Frame(control_inner, bg=self.PANEL)
         controls.grid(row=3, column=0, sticky="ew", pady=(2, 0))
@@ -1185,49 +1247,161 @@ class BotGUI:
         if not self.bot.is_running():
             self._set_bot_status("stopped")
 
+    def _current_strategy_mode(self) -> str:
+        if not bool(getattr(self.bot, "ai_enabled", False)):
+            return "rule"
+        name = str(
+            getattr(self.bot, "brain_config", {}).get("name", "rule") or "rule"
+        ).strip().lower()
+        if name in ("local_llm", "ollama", "local"):
+            return "local_llm"
+        if name in ("gemini", "llm"):
+            return "gemini"
+        return "rule"
+
     def _on_ai_mode_toggle(self):
-        enabled = bool(self.ai_mode_var.get())
-        previous = bool(getattr(self.bot, "ai_enabled", False))
-        try:
-            self.bot.set_ai_enabled(enabled)
-            candidate = dict(self.settings)
-            brain_settings = candidate.get("brain")
-            brain_settings = (
-                dict(brain_settings) if isinstance(brain_settings, dict) else {}
-            )
-            brain_settings["use_ai"] = enabled
-            candidate["brain"] = brain_settings
-            if not save_settings(candidate):
-                raise OSError("Could not save AI mode to settings.json.")
-            self.settings = candidate
-        except (OSError, RuntimeError) as exc:
-            if bool(getattr(self.bot, "ai_enabled", False)) != previous:
-                self.bot.set_ai_enabled(previous)
-            self.ai_mode_var.set(previous)
-            messagebox.showerror("AI mode", str(exc))
+        order = ("rule", "local_llm", "gemini")
+        current = self._current_strategy_mode()
+        next_idx = (order.index(current) + 1) % len(order) if current in order else 0
+        for step in range(len(order)):
+            candidate_mode = order[(next_idx + step) % len(order)]
+            try:
+                if hasattr(self.bot, "set_strategy_mode"):
+                    self.bot.set_strategy_mode(candidate_mode)
+                else:
+                    self.bot.set_ai_enabled(candidate_mode != "rule")
+                candidate = dict(self.settings)
+                brain_settings = candidate.get("brain")
+                brain_settings = (
+                    dict(brain_settings) if isinstance(brain_settings, dict) else {}
+                )
+                brain_settings["name"] = candidate_mode
+                brain_settings["use_ai"] = candidate_mode != "rule"
+                candidate["brain"] = brain_settings
+                save_settings(candidate)
+                self.settings = candidate
+                break
+            except (OSError, RuntimeError) as exc:
+                if step == len(order) - 1:
+                    messagebox.showerror("Strategy mode", str(exc))
+                continue
+        self.ai_mode_var.set(bool(getattr(self.bot, "ai_enabled", False)))
         self._update_ai_mode_control()
 
     def _update_ai_mode_control(self):
-        brain_alt = getattr(self.bot, "brain_alt", None)
-        if brain_alt is None or not getattr(brain_alt, "enabled", False):
-            self.ai_mode_text.set(
-                "Rule-based (Default)  ▾"
+        mode = self._current_strategy_mode()
+        policy_ready = bool(
+            getattr(getattr(self.bot, "policy_planner", None), "loaded", False)
+        )
+        suffix = " + PolicyNet" if policy_ready else ""
+        labels = {
+            "rule": f"Rule-based{suffix}  ▾",
+            "local_llm": f"Local AI (Ollama RTX){suffix}  ▾",
+            "gemini": f"Gemini Cloud AI{suffix}  ▾",
+        }
+        self.ai_mode_text.set(labels.get(mode, labels["rule"]))
+        running = self.bot_status in (
+            "running", "farming", "loading", "starting", "stopping"
+        )
+        self.ai_mode_btn.config(
+            state="disabled" if running else "normal",
+            fg=self.TEXT,
+        )
+
+    def _on_learn_from_video(self):
+        if self.bot.is_running():
+            messagebox.showwarning(
+                "Learn from Video",
+                "Stop the bot first before training from an attack video.",
             )
-            self.ai_mode_btn.config(state="disabled", fg=self.MUTED)
-        else:
-            enabled = bool(self.ai_mode_var.get())
-            self.ai_mode_text.set(
-                "Gemini AI + Rule Fallback  ▾"
-                if enabled
-                else "Rule-based (Default)  ▾"
-            )
-            running = self.bot_status in (
-                "running", "farming", "loading", "starting", "stopping"
-            )
-            self.ai_mode_btn.config(
-                state="disabled" if running else "normal",
-                fg=self.TEXT,
-            )
+            return
+        video_path = filedialog.askopenfilename(
+            title="Select Clash of Clans Attack Gameplay Video",
+            filetypes=[
+                ("Video files", "*.mp4 *.mkv *.avi *.mov"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not video_path:
+            return
+
+        self.learn_video_btn.config(state="disabled", text="⏳ Training PolicyNet...")
+        self._log(f"[Deep Learning] Extracting attack demonstrations from: {os.path.basename(video_path)}")
+
+        def _worker():
+            try:
+                self.bot.vision.load()
+                extractor = VideoAttackExtractor(
+                    vision=self.bot.vision,
+                    slot_names=list(self.bot.troops.get("slots") or ["s_goblin"]),
+                )
+                demo = extractor.extract_from_video(video_path, sample_fps=4.0)
+                self.msg_queue.put(
+                    {
+                        "type": "log",
+                        "text": (
+                            f"[Deep Learning] Extracted {len(demo.get('taps', []))} "
+                            f"human tap samples and {len(demo.get('storages', []))} storages."
+                        ),
+                    }
+                )
+                metrics = train_policy_from_dataset(epochs=60)
+                if getattr(self.bot, "policy_planner", None) is not None:
+                    self.bot.policy_planner.reload()
+                self.msg_queue.put(
+                    {
+                        "type": "log",
+                        "text": (
+                            f"[Deep Learning] PolicyNet trained on {metrics['device']}! "
+                            f"Samples={metrics['samples']}, Loss={metrics['final_loss']:.4f}, "
+                            f"Saved to {os.path.basename(metrics['weights_path'])}"
+                        ),
+                    }
+                )
+            except Exception as exc:
+                self.msg_queue.put(
+                    {
+                        "type": "log",
+                        "text": f"[Deep Learning] Training error: {exc}",
+                    }
+                )
+            finally:
+                self.root.after(
+                    0,
+                    lambda: (
+                        self.learn_video_btn.config(
+                            state="normal", text="🎬 Learn Attack (.mp4)"
+                        ),
+                        self._update_ai_mode_control(),
+                    ),
+                )
+
+        threading.Thread(target=_worker, daemon=True, name="VideoLearnerThread").start()
+
+    def _on_target_mode_cycle(self):
+        order = ("smart", "and", "or")
+        current = str(self.target_mode_var.get() or "smart").lower()
+        next_mode = order[(order.index(current) + 1) % len(order)] if current in order else "smart"
+        self.target_mode_var.set(next_mode)
+        if hasattr(self.bot, "set_target_mode"):
+            self.bot.set_target_mode(next_mode)
+        candidate = dict(self.settings)
+        attack_cfg = candidate.get("attack")
+        attack_cfg = dict(attack_cfg) if isinstance(attack_cfg, dict) else {}
+        attack_cfg["target_mode"] = next_mode
+        candidate["attack"] = attack_cfg
+        if save_settings(candidate):
+            self.settings = candidate
+        self._update_target_mode_control()
+
+    def _update_target_mode_control(self):
+        labels = {
+            "smart": "Smart (Combo + Dead Base)  ▾",
+            "and": "Strict (All Targets / AND)  ▾",
+            "or": "Flexible (Any Target / OR)  ▾",
+        }
+        mode = str(self.target_mode_var.get() or "smart").lower()
+        self.target_mode_text.set(labels.get(mode, labels["smart"]))
 
     def _on_stop(self):
         self.stop_btn.config(state="disabled")

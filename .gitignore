@@ -36,8 +36,12 @@ logs/
 logs_*/
 *.log
 
-# Local user settings (selected emulator window)
+# Local user settings & video training datasets
 settings.json
+dataset/*.jsonl
+*.mp4
+*.mkv
+*.avi
 
 # IDE
 .vscode/

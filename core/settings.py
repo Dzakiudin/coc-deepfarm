@@ -2,7 +2,7 @@ import json
 import logging
 import os
 
-from utils import resource_path, user_path
+from core.utils import resource_path, user_path
 
 logger = logging.getLogger(__name__)
 

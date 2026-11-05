@@ -2,7 +2,7 @@ import logging
 import os
 import sys
 
-from utils import user_path
+from core.utils import user_path
 
 
 def setup_logging(level=logging.INFO):

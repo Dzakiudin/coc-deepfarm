@@ -2,7 +2,7 @@ import logging
 import shutil
 import time
 
-from adb import VideoCaptureStream
+from device.adb import VideoCaptureStream
 
 logger = logging.getLogger(__name__)
 
@@ -11,7 +11,9 @@ class WindowManager:
 
     def __init__(self, adb):
         if adb is None:
-            raise ValueError("WindowManager requires a connected EmulatorAdb (ADB-only mode)")
+            raise ValueError(
+                "WindowManager requires a connected EmulatorAdb (ADB-only mode)"
+            )
         self.adb = adb
         self.win_left = 0
         self.win_top = 0
@@ -20,9 +22,6 @@ class WindowManager:
         self.last_capture_ms = 0.0
         self.video_stream = None
         self._video_fallback_logged = False
-
-    def focus_window(self):
-        pass
 
     def start_video_capture(self):
         if self.video_stream is not None:
@@ -80,9 +79,6 @@ class WindowManager:
         if self.video_stream is not None:
             self.video_stream.stop()
             self.video_stream = None
-
-    def get_rect(self):
-        return self.capture_window()
 
     def capture_window(self):
         if self.video_stream is not None:

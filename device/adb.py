@@ -498,16 +498,26 @@ class EmulatorAdb:
         )
         return p is not None and p.returncode == 0
 
-    def tap_many(self, points, timeout=None):
+    def tap_many(self, points, timeout=None, batch_size=4):
         if not self._connected:
             return False
         points = [(int(x), int(y)) for x, y in points]
         if not points:
             return True
-        cmd = "; ".join(f"input tap {x} {y}" for x, y in points)
+        batch_size = max(1, int(batch_size or 1))
+        if len(points) <= 2 or batch_size == 1:
+            cmd = "; ".join(f"input tap {x} {y}" for x, y in points)
+        else:
+            groups = []
+            for i in range(0, len(points), batch_size):
+                chunk = points[i : i + batch_size]
+                groups.append(
+                    " & ".join(f"input tap {x} {y}" for x, y in chunk) + " & wait"
+                )
+            cmd = "; ".join(groups)
         p = self._run(
             ["shell", cmd],
-            timeout=timeout or max(10.0, len(points) * 0.25 + 5.0),
+            timeout=timeout or max(10.0, len(points) * 0.15 + 5.0),
         )
         return p is not None and p.returncode == 0
 

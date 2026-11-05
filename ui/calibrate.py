@@ -38,18 +38,34 @@ BUTTON_COLORS = [
     "#ffb3c1",
 ]
 
+import os
+import subprocess
 import sys
 import time
 import tkinter as tk
 from tkinter import messagebox
 
+_ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT_DIR not in sys.path:
+    sys.path.insert(0, _ROOT_DIR)
+_VENV_PY = os.path.join(_ROOT_DIR, ".venv", "Scripts", "python.exe")
+if (
+    not getattr(sys, "frozen", False)
+    and sys.argv
+    and os.path.isfile(sys.argv[0])
+    and os.path.isfile(_VENV_PY)
+    and os.path.normcase(os.path.abspath(sys.executable)) != os.path.normcase(_VENV_PY)
+):
+    raise SystemExit(subprocess.call([_VENV_PY, *sys.argv]))
+
 import cv2
 import numpy as np
 from PIL import Image, ImageTk
 
-from config import AppConfig
-from adb import EmulatorAdb
-from settings import load_settings, save_settings
+from core.config import AppConfig
+from device.adb import EmulatorAdb
+from core.settings import load_settings, save_settings
+from core.utils import user_path
 
 
 class Calibrator:
@@ -89,8 +105,7 @@ class Calibrator:
 
         sub = tk.Label(
             root,
-            text="Left-click each button below in the screenshot. "
-            "Coordinates are saved as fractions of the screen.",
+            text="Klik 1x titik tombol ATAU Klik & Geser (drag kotak) untuk crop area tombol secara utuh.",
             font=("Segoe UI", 9),
             fg="#bdc1c6",
             bg="#202124",
@@ -102,7 +117,11 @@ class Calibrator:
         )
         self.canvas.grid(row=1, column=0, sticky="nsew", padx=8, pady=(4, 8))
         self.canvas.bind("<Button-1>", self.on_canvas_click)
+        self.canvas.bind("<B1-Motion>", self.on_canvas_drag)
+        self.canvas.bind("<ButtonRelease-1>", self.on_canvas_release)
         self.canvas.bind("<Configure>", self._on_resize)
+        self._drag_start = None
+        self._drag_rect_id = None
 
         list_wrap = tk.Frame(root, bg="#202124")
         list_wrap.grid(row=2, column=0, sticky="we")
@@ -288,14 +307,74 @@ class Calibrator:
     def on_canvas_click(self, event):
         if self.index >= len(BUTTONS) or self._img is None:
             return
-        name, _ = BUTTONS[self.index]
-        ox, oy = self._to_orig(event.x, event.y)
-        im_w, im_h = self._img.shape[1], self._img.shape[0]
-        norm = {"x": round(ox / im_w, 5), "y": round(oy / im_h, 5)}
+        self._drag_start = (event.x, event.y)
+        if self._drag_rect_id is not None:
+            self.canvas.delete(self._drag_rect_id)
+            self._drag_rect_id = None
 
+    def on_canvas_drag(self, event):
+        if not self._drag_start or self._img is None:
+            return
+        x0, y0 = self._drag_start
+        x1, y1 = event.x, event.y
+        if self._drag_rect_id is None:
+            self._drag_rect_id = self.canvas.create_rectangle(
+                x0, y0, x1, y1, outline="#00ffcc", width=2, dash=(4, 4)
+            )
+        else:
+            self.canvas.coords(self._drag_rect_id, x0, y0, x1, y1)
+
+    def on_canvas_release(self, event):
+        if not self._drag_start or self.index >= len(BUTTONS) or self._img is None:
+            self._drag_start = None
+            return
+
+        x0, y0 = self._drag_start
+        x1, y1 = event.x, event.y
+        self._drag_start = None
+
+        if self._drag_rect_id is not None:
+            self.canvas.delete(self._drag_rect_id)
+            self._drag_rect_id = None
+
+        name, _ = BUTTONS[self.index]
+        im_w, im_h = self._img.shape[1], self._img.shape[0]
+
+        # Check if user dragged a box (> 12px) or just single-clicked
+        dist = ((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5
+        tpl_dir = user_path("templates")
+        os.makedirs(tpl_dir, exist_ok=True)
+
+        if dist >= 12:
+            # User dragged a manual crop bounding box!
+            ox0, oy0 = self._to_orig(min(x0, x1), min(y0, y1))
+            ox1, oy1 = self._to_orig(max(x0, x1), max(y0, y1))
+            cx = (ox0 + ox1) // 2
+            cy = (oy0 + oy1) // 2
+            crop = self._img[oy0:oy1, ox0:ox1]
+            if crop.size > 0:
+                tpl_path = os.path.join(tpl_dir, f"{name}.png")
+                cv2.imwrite(tpl_path, crop)
+                self.status_var.set(f"Saved custom crop for {name} ({crop.shape[1]}x{crop.shape[0]})")
+        else:
+            # Single click: calculate center and use generous bounding box
+            cx, cy = self._to_orig(x0, y0)
+            crop_rx = max(38, int(im_w * 0.055))
+            crop_ry = max(30, int(im_h * 0.055))
+            y_start = max(0, cy - crop_ry)
+            y_end = min(im_h, cy + crop_ry)
+            x_start = max(0, cx - crop_rx)
+            x_end = min(im_w, cx + crop_rx)
+            crop = self._img[y_start:y_end, x_start:x_end]
+            if crop.size > 0:
+                tpl_path = os.path.join(tpl_dir, f"{name}.png")
+                cv2.imwrite(tpl_path, crop)
+
+        norm = {"x": round(cx / im_w, 5), "y": round(cy / im_h, 5)}
         self._undo_stack.append((name, self.controls.get(name)))
         self.controls[name] = norm
         self.status_labels[name].config(text=self._fmt(norm))
+
         if not self.fix_mode:
             self.index = min(len(BUTTONS), self.index + 1)
         self._paint_rows()

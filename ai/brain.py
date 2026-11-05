@@ -8,6 +8,114 @@ import urllib.request
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "gemini-2.5-flash"
+DEFAULT_FALLBACK_MODEL = "gemini-2.5-flash-lite"
+_MODEL_ALIASES = {
+    "gemini-3.5-flash": "gemini-2.5-flash-lite",
+    "gemini-3.8-flash": "gemini-2.5-flash",
+}
+
+
+def normalize_model_name(name: str | None, default: str = DEFAULT_MODEL) -> str:
+    raw = str(name or "").strip()
+    if not raw:
+        return default
+    return _MODEL_ALIASES.get(raw.lower(), raw)
+
+
+def evaluate_loot_targets(
+    loot: dict,
+    targets: dict,
+    mode: str = "and",
+    dead_base: bool = False,
+) -> bool:
+    """
+    Evaluate whether base loot satisfies target thresholds under:
+    - 'and': all resources meet their respective targets
+    - 'or': at least one resource with a positive target meets its target
+    - 'smart': standard AND, OR combined Gold+Elixir >= 1.15x target sum,
+      OR single jackpot >= 1.6x target, plus a 15% threshold discount on Dead Bases.
+    """
+    mode_norm = str(mode or "and").strip().lower()
+    gold = int(loot.get("gold", 0) or 0)
+    elixir = int(loot.get("elixir", 0) or 0)
+    delixir = int(loot.get("delixir", 0) or 0)
+
+    g_req = int(targets.get("gold", 0) or 0)
+    e_req = int(targets.get("elixir", 0) or 0)
+    d_req = int(targets.get("delixir", 0) or 0)
+
+    if mode_norm == "or":
+        checks = []
+        if g_req > 0:
+            checks.append(gold >= g_req)
+        if e_req > 0:
+            checks.append(elixir >= e_req)
+        if d_req > 0:
+            checks.append(delixir >= d_req)
+        return any(checks) if checks else True
+
+    if mode_norm == "smart":
+        discount = 0.85 if dead_base else 1.0
+        sg = int(g_req * discount)
+        se = int(e_req * discount)
+        sd = int(d_req * discount)
+        if gold >= sg and elixir >= se and delixir >= sd:
+            return True
+        if (sg + se) > 0 and (gold + elixir) >= int((sg + se) * 1.15):
+            if sd == 0 or delixir >= int(sd * 0.7):
+                return True
+        if sg > 0 and gold >= int(sg * 1.6) and (se == 0 or elixir >= int(se * 0.5)):
+            return True
+        if se > 0 and elixir >= int(se * 1.6) and (sg == 0 or gold >= int(sg * 0.5)):
+            return True
+        return False
+
+    return gold >= g_req and elixir >= e_req and delixir >= d_req
+
+
+def infer_target_side(base_geom: dict) -> str:
+    """
+    Choose 'left' or 'right' if >= 72% of detected stores cluster on one side, else 'all'.
+    """
+    if not isinstance(base_geom, dict):
+        return "all"
+    storages = base_geom.get("storages") or []
+    if len(storages) < 4:
+        return "all"
+    left_count = sum(1 for s in storages if float(s.get("x", 0.5)) <= 0.48)
+    right_count = sum(1 for s in storages if float(s.get("x", 0.5)) >= 0.52)
+    total = len(storages)
+    if left_count / total >= 0.72:
+        return "left"
+    if right_count / total >= 0.72:
+        return "right"
+    return "all"
+
+
+def should_consult_ai(state: dict) -> bool:
+    """
+    Pre-filter to avoid burning Gemini API RPM quota on obviously empty bases while scouting.
+    Consults AI when the base meets targets, or reaches at least 65% of target loot, or is a dead base.
+    """
+    if not isinstance(state, dict):
+        return False
+    loot = state.get("loot") or {}
+    targets = state.get("targets") or {}
+    base_geom = state.get("base") or {}
+    attack_cfg = state.get("attack") or {}
+    dead_base = bool(base_geom.get("dead_base", False))
+    target_mode = str(attack_cfg.get("target_mode") or "and")
+
+    if evaluate_loot_targets(loot, targets, mode=target_mode, dead_base=dead_base):
+        return True
+    if dead_base:
+        return True
+
+    relaxed_targets = {
+        k: int(float(targets.get(k, 0) or 0) * 0.65)
+        for k in ("gold", "elixir", "delixir")
+    }
+    return evaluate_loot_targets(loot, relaxed_targets, mode="or", dead_base=False)
 GENERATE_ENDPOINT = (
     "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 )
@@ -82,16 +190,19 @@ class RuleBrain(Brain):
         try:
             loot = state["loot"]
             targets = state["targets"]
-            skip_base = not (
-                loot["gold"] >= targets["gold"]
-                and loot["elixir"] >= targets["elixir"]
-                and loot["delixir"] >= targets["delixir"]
+            attack_cfg = state.get("attack") if isinstance(state.get("attack"), dict) else {}
+            base_geom = state.get("base") if isinstance(state.get("base"), dict) else {}
+            target_mode = attack_cfg.get("target_mode", "and")
+            dead_base = bool(base_geom.get("dead_base", False))
+            meets = evaluate_loot_targets(
+                loot, targets, mode=target_mode, dead_base=dead_base
             )
+            skip_base = not meets
             return {
                 "skip_base": skip_base,
                 "deploy_order": list(state["troop_slots"]),
                 "surrender_after_s": float(state["attack"]["time_limit"]),
-                "target_side": "all",
+                "target_side": infer_target_side(base_geom),
             }
         except Exception as e:
             logger.debug(f"RuleBrain could not plan from state: {e}")
@@ -112,8 +223,12 @@ class GeminiBrain(Brain):
         thinking_level="low",
         fallback_model=None,
     ):
-        self.model = model
-        self.fallback_model = fallback_model or None
+        self.model = normalize_model_name(model, default=DEFAULT_MODEL)
+        self.fallback_model = (
+            normalize_model_name(fallback_model, default="") or None
+            if fallback_model
+            else None
+        )
         self.api_key = api_key or os.environ.get(api_key_env)
         self.api_key_env = api_key_env
         self.timeout_s = float(timeout_s)
@@ -387,4 +502,119 @@ class GeminiBrain(Brain):
         if not all(key in result for key in required):
             return {}
         return result
+
+
+DEFAULT_LOCAL_MODEL = "qwen2.5vl:3b"
+DEFAULT_OLLAMA_ENDPOINT = "http://127.0.0.1:11434/api/generate"
+
+
+class LocalLLMBrain(GeminiBrain):
+    """
+    Local LLM / VLM strategic brain powered by Ollama or a local OpenAI-compatible server.
+    Designed to run locally on an NVIDIA RTX 4060 (8GB VRAM) with zero rate limits.
+    Supports both structured state JSON and direct base screenshot vision (VLM).
+    """
+
+    name = "local_llm"
+
+    def __init__(
+        self,
+        model: str = DEFAULT_LOCAL_MODEL,
+        endpoint: str | None = None,
+        timeout_s: float = 12.0,
+        vision: bool = True,
+    ):
+        self.model = str(model or DEFAULT_LOCAL_MODEL).strip()
+        self.endpoint = str(endpoint or DEFAULT_OLLAMA_ENDPOINT).strip()
+        self.timeout_s = float(timeout_s)
+        self.vision = bool(vision)
+        self.enabled = True
+        self.last_error = ""
+
+    def describe(self) -> str:
+        mode = "vlm+json" if self.vision else "json"
+        return f"local_llm/{self.model} ({mode}) endpoint={self.endpoint}"
+
+    @staticmethod
+    def _encode_frame_base64(frame) -> str | None:
+        if frame is None or getattr(frame, "size", 0) == 0:
+            return None
+        try:
+            import base64
+            import cv2
+
+            h, w = frame.shape[:2]
+            if w > 960:
+                scale = 960.0 / float(w)
+                frame = cv2.resize(
+                    frame,
+                    (960, max(1, int(h * scale))),
+                    interpolation=cv2.INTER_AREA,
+                )
+            ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            if not ok:
+                return None
+            return base64.b64encode(buf.tobytes()).decode("ascii")
+        except Exception as e:
+            logger.debug(f"local_llm frame encode failed: {e}")
+            return None
+
+    def plan(self, state: dict, frame=None) -> dict:
+        if not self.enabled:
+            return {}
+
+        payload_text = json.dumps(state, ensure_ascii=False)
+        body: dict = {
+            "model": self.model,
+            "system": SYSTEM_INSTRUCTION,
+            "prompt": payload_text,
+            "stream": False,
+            "format": PLAN_SCHEMA,
+            "keep_alive": "15m",
+            "options": {
+                "temperature": 0.15,
+                "num_predict": 256,
+            },
+        }
+
+        if self.vision and frame is not None:
+            encoded_img = self._encode_frame_base64(frame)
+            if encoded_img:
+                body["images"] = [encoded_img]
+
+        req = urllib.request.Request(
+            self.endpoint,
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+            self.last_error = ""
+        except Exception as e:
+            logger.warning(f"local_llm request failed ({self.endpoint}): {e}")
+            self.last_error = str(e)
+            return {}
+
+        try:
+            resp_json = json.loads(raw)
+        except Exception as e:
+            logger.warning(f"local_llm returned non-JSON: {e}")
+            self.last_error = "invalid json response"
+            return {}
+
+        text = resp_json.get("response") or self._extract_text(resp_json)
+        if not text:
+            self.last_error = "empty model response"
+            return {}
+
+        try:
+            parsed = json.loads(text) if isinstance(text, str) else text
+        except Exception as e:
+            logger.warning(f"local_llm plan was not valid JSON: {e}")
+            self.last_error = "invalid plan json"
+            return {}
+
+        return self._sanitize(parsed, state)
 

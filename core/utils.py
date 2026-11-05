@@ -11,7 +11,7 @@ def is_frozen() -> bool:
 def bundle_dir() -> str:
     if is_frozen():
         return getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
-    return os.path.dirname(os.path.abspath(__file__))
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def user_data_dir() -> str:
@@ -19,7 +19,7 @@ def user_data_dir() -> str:
         base = os.environ.get("APPDATA") or os.path.expanduser("~")
         path = os.path.join(base, APP_DIR_NAME)
     else:
-        path = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     os.makedirs(path, exist_ok=True)
     return path
 

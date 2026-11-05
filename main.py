@@ -1,26 +1,40 @@
-print("COC Auto-Farm: starting...", flush=True)
-
 import atexit
 import logging
 import os
 import queue
+import subprocess
 import sys
+
+
+def _ensure_venv():
+    """If launched with system Python instead of .venv, re-launch inside .venv automatically."""
+    if getattr(sys, "frozen", False) or not sys.argv or not os.path.isfile(sys.argv[0]):
+        return
+    root_dir = os.path.dirname(os.path.abspath(__file__))
+    venv_py = os.path.join(root_dir, ".venv", "Scripts", "python.exe")
+    if os.path.isfile(venv_py) and os.path.normcase(os.path.abspath(sys.executable)) != os.path.normcase(venv_py):
+        raise SystemExit(subprocess.call([venv_py, *sys.argv]))
+
+
+_ensure_venv()
+print("COC Auto-Farm: starting...", flush=True)
+
 import tkinter as tk
 from tkinter import messagebox, ttk
 
 import keyboard
 
-from config import AppConfig
-from adb import EmulatorAdb
-from logger import setup_logging
-from window_manager import WindowManager
-from settings import load_settings
-from vision import VisionManager
-from automation import AutomationController
-from bot import CocBot
-from gui import BotGUI
-from notify import Notifier
-from utils import configure_runtime_env, resource_path
+from core.config import AppConfig
+from device.adb import EmulatorAdb
+from services.logger import setup_logging
+from device.window_manager import WindowManager
+from core.settings import load_settings
+from perception.vision import VisionManager
+from device.automation import AutomationController
+from core.bot import CocBot
+from ui.gui import BotGUI
+from services.notify import Notifier
+from core.utils import configure_runtime_env, resource_path
 
 logger = logging.getLogger(__name__)
 
@@ -58,8 +72,8 @@ def _selftest():
 
     try:
         from ultralytics import YOLO
-        from config import AppConfig
-        from utils import resource_path
+        from core.config import AppConfig
+        from core.utils import resource_path
 
         model = resource_path(AppConfig().model_path)
         if not os.path.exists(model):
