@@ -1,34 +1,39 @@
-# Troubleshooting
+# 🛠️ Troubleshooting Guide
 
-## "Could not connect to the emulator via ADB"
+## 1. Emulator & ADB Connection
 
-1. Ensure the emulator is running and ADB is enabled (e.g., MuMu Player port `16384` or LDPlayer port `5555`).
-2. Verify with `adb devices` that the instance shows as `device` (not `offline`).
+### "Emulator Belum Terdeteksi" / ADB Not Connected
+> [!TIP]
+> You no longer need to restart the bot if you forgot to open your emulator first!
 
-## "Run calibrate.py first" when pressing Start
+1. Start your Android emulator (**MuMu Player 12**, **LDPlayer**, **BlueStacks**, or **MEmu**).
+2. Click **`🔌 Connect ADB`** in the top toolbar of the dashboard (or simply click **`▶ Start Farming`**—the Pre-Flight Check will connect automatically).
+3. If using **LDPlayer** or **BlueStacks**, ensure **ADB Debugging / Local Connection** is enabled in the emulator's settings.
 
-`settings.json` is missing one of the required button coordinates. Run:
+---
 
-```powershell
-python ui/calibrate.py
-```
+## 2. Button Clicks & Resolution
 
-Set all required buttons, click **Save**, and relaunch `python main.py`.
+### Buttons Click Slightly Off-Target on a Custom Aspect Ratio
+- Standard 16:9 resolutions (`1280x720`, `1600x900`, `1920x1080`, `1680x720`) work automatically using the built-in `DEFAULT_CONTROLS` preset.
+- If your emulator uses a non-standard aspect ratio:
+  1. Click **`🎯 Calibrate`** in the dashboard header.
+  2. Click or drag a bounding box around the specific button you want to adjust (or click **Reset Preset** to restore defaults).
+  3. Click **Save to settings**.
 
-## "Could not find [class] after X attempts"
+---
 
-YOLO did not detect storages or resource counters within `max_retries` captures:
-- Raise `recovery.scan_restart_limit` in `settings.json`.
-- Increase `waits.scan_base_first` or `waits.scan_treasures_first` if your emulator loads slowly.
+## 3. Vision & OCR Scanning
 
-## Post-battle loot reads 0 or surrender dialog doesn't close
+### "Could not find [class] after X attempts"
+- Ensure Clash of Clans is open on your main village screen before pressing **`▶ Start Farming`**.
+- If your internet or emulator loads clouds slowly, increase `waits.scan_base_first` (default `4.0` seconds) or `recovery.scan_restart_limit` in [`settings.json`](../settings.json).
 
-- Critical progression buttons (`surr_conf`, `return_home`, `nxt_btn`) automatically fall back to calibrated coordinates even when `click_verify_strict` is enabled.
-- Re-verify `surr` and `surr_conf` in `python ui/calibrate.py` while in an active battle if the quit confirmation button moved.
+---
 
-## GPU / CUDA Acceleration
+## 4. GPU / CUDA Acceleration Check
 
-`main.py` automatically re-launches inside `.venv\Scripts\python.exe`. Verify CUDA availability at any time with:
+Verify that PyTorch CUDA, YOLO, and EasyOCR are running on your NVIDIA GPU at any time with:
 
 ```powershell
 python main.py --selftest

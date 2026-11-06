@@ -21,8 +21,20 @@ class SettingsTemplateTests(unittest.TestCase):
             ):
                 loaded = settings.load_settings()
 
-            self.assertEqual(loaded, {"controls": {}, "brain": {"name": "coc_ai", "use_ai": True}, "notifications": {"enabled": False}})
+            self.assertEqual(
+                loaded,
+                {
+                    "controls": settings.DEFAULT_CONTROLS,
+                    "brain": {"name": "coc_ai", "use_ai": True},
+                    "notifications": {"enabled": False},
+                },
+            )
             self.assertEqual(json.loads(settings_path.read_text(encoding="utf-8")), loaded)
+
+            merged = settings.ensure_default_controls({"find_btn": {"x": 0.25, "y": 0.75}})
+            self.assertEqual(merged["find_btn"], {"x": 0.25, "y": 0.75})
+            self.assertEqual(merged["attack_btn"], settings.DEFAULT_CONTROLS["attack_btn"])
+            self.assertEqual(len(merged), 16)
 
     def test_existing_user_settings_are_not_overwritten(self):
         with tempfile.TemporaryDirectory() as temp_dir:

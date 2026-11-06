@@ -16,7 +16,7 @@ from PIL import Image, ImageDraw, ImageTk
 from ai.brain import train_commander_from_data
 from ai.policy_net import train_policy_from_dataset
 from ai.video_learner import VideoAttackExtractor
-from core.settings import save_settings
+from core.settings import ensure_default_controls, save_settings
 from core.utils import user_path
 
 
@@ -311,6 +311,25 @@ class BotGUI:
             pady=4,
         )
         self.brain_device_badge.pack(side="left", padx=(0, 6))
+
+        adb_obj = getattr(getattr(self.bot, "window", None), "adb", None)
+        adb_ok = bool(getattr(adb_obj, "serial", None))
+        self.adb_connect_btn = tk.Button(
+            nav_pill,
+            text="🔌 ADB Ready" if adb_ok else "🔌 Connect ADB",
+            command=self._on_connect_adb,
+            bg="#143829" if adb_ok else "#3b2314",
+            activebackground="#166534",
+            fg=self.GREEN if adb_ok else self.GOLD,
+            activeforeground="#ffffff",
+            relief="flat",
+            bd=0,
+            padx=10,
+            pady=3,
+            font=("Segoe UI", 8, "bold"),
+            cursor="hand2",
+        )
+        self.adb_connect_btn.pack(side="left", padx=3)
 
         self.quick_retrain_btn = tk.Button(
             nav_pill,
@@ -1176,6 +1195,51 @@ class BotGUI:
             self.perf_note.set("Measured milliseconds · Capture / YOLO / OCR latency")
         self._draw_performance()
 
+    def _on_connect_adb(self):
+        adb_obj = getattr(getattr(self.bot, "window", None), "adb", None)
+        if adb_obj is None:
+            return
+        self.adb_connect_btn.config(state="disabled", text="⏳ Connecting...")
+        self._log("[ADB] Mencari dan menghubungkan ke emulator Android...")
+
+        def _worker():
+            ok = False
+            err = ""
+            try:
+                ok = bool(adb_obj.connect())
+                if ok:
+                    self.bot.window.start_video_capture()
+                else:
+                    err = str(getattr(adb_obj, "last_error", "") or "Emulator tidak ditemukan")
+            except Exception as exc:
+                err = str(exc)
+
+            def _done():
+                if ok:
+                    self.adb_connect_btn.config(
+                        state="normal",
+                        text="🔌 ADB Ready",
+                        bg="#143829",
+                        fg=self.GREEN,
+                    )
+                    self._log(
+                        f"[ADB] Berhasil terhubung ke emulator ({getattr(adb_obj, 'serial', 'device')})!"
+                    )
+                else:
+                    self.adb_connect_btn.config(
+                        state="normal",
+                        text="🔌 Connect ADB",
+                        bg="#3b2314",
+                        fg=self.GOLD,
+                    )
+                    self._log(
+                        f"[ADB] Belum terhubung ({err}). Pastikan emulator (LDPlayer/MuMu/BlueStacks) sudah menyala."
+                    )
+
+            self.root.after(0, _done)
+
+        threading.Thread(target=_worker, daemon=True, name="AdbConnectThread").start()
+
     def _on_open_calibrator(self):
         if self.bot.is_running():
             messagebox.showwarning(
@@ -1500,6 +1564,37 @@ class BotGUI:
         except (tk.TclError, ValueError) as exc:
             messagebox.showerror("Invalid target", str(exc) or "Enter non-negative integers.")
             return
+
+        # Pre-Flight Check 1: Ensure all 16 Clash of Clans button coordinates exist (Universal Preset fallback)
+        merged_controls = ensure_default_controls(getattr(self.bot, "controls", None))
+        if getattr(self.bot, "controls", None) != merged_controls:
+            self.bot.controls = merged_controls
+            self.settings["controls"] = merged_controls
+            save_settings(self.settings)
+            self._log("[Pre-Flight] Koordinat tombol CoC otomatis dilengkapi dari Universal Preset.")
+
+        # Pre-Flight Check 2: Auto-connect ADB if emulator wasn't connected when GUI opened
+        adb_obj = getattr(getattr(self.bot, "window", None), "adb", None)
+        if adb_obj is not None and not getattr(adb_obj, "serial", None):
+            self._log("[Pre-Flight] Menghubungkan otomatis ke emulator via ADB...")
+            if adb_obj.connect():
+                self.bot.window.start_video_capture()
+                if hasattr(self, "adb_connect_btn"):
+                    self.adb_connect_btn.config(
+                        text="🔌 ADB Ready", bg="#143829", fg=self.GREEN
+                    )
+                self._log(f"[Pre-Flight] Emulator terhubung ({adb_obj.serial})!")
+            else:
+                messagebox.showwarning(
+                    "Emulator Belum Terdeteksi",
+                    "Bot belum bisa menemukan emulator Android yang aktif.\n\n"
+                    "Langkah mudah:\n"
+                    "1. Buka emulator (LDPlayer / MuMu / BlueStacks / MEmu).\n"
+                    "2. Buka game Clash of Clans.\n"
+                    "3. Klik tombol '▶ Start Farming' lagi!",
+                )
+                return
+
         self.start_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
         self.ai_mode_btn.config(state="disabled")
@@ -2193,7 +2288,8 @@ class BotGUI:
                         self._queue_preview_frame(frame)
                     self._preview_stop.wait(1.0 / 20.0)
                     continue
-                if not self.bot.is_running():
+                adb_obj = getattr(getattr(self.bot, "window", None), "adb", None)
+                if not self.bot.is_running() and getattr(adb_obj, "serial", None):
                     frame = self.bot.window.capture_window()
                     self._queue_preview_frame(frame)
             except Exception:

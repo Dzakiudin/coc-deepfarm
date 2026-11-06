@@ -28,7 +28,7 @@ from core.config import AppConfig
 from device.adb import EmulatorAdb
 from services.logger import setup_logging
 from device.window_manager import WindowManager
-from core.settings import load_settings
+from core.settings import ensure_default_controls, load_settings, save_settings
 from perception.vision import VisionManager
 from device.automation import AutomationController
 from core.bot import CocBot
@@ -146,38 +146,25 @@ def main():
     )
     step("Connecting to the emulator over ADB...")
     splash.update()
-    if not adb.connect():
-        logger.error(f"ADB connect failed: {adb.last_error}")
-        notifier.notify(
-            "COC Auto-Farm: ADB error",
-            "Could not connect to the emulator via ADB. "
-            f"Details: {adb.last_error}",
-            blocking=True,
-            priority="high",
-            tags="warning",
-        )
-        splash.destroy()
-        messagebox.showerror(
-            "ADB Error",
-            "Could not connect to the emulator via ADB.\n\n"
-            "Start the emulator and enable 'ADB local connection' in LDPlayer "
-            "settings (Settings > Others).\n"
-            "Expected device: 127.0.0.1:5555 (first instance).\n\n"
-            f"Details: {adb.last_error}",
-        )
-        sys.exit(1)
+    adb_connected = adb.connect()
+    if not adb_connected:
+        logger.warning(f"ADB not connected at startup (will auto-reconnect from GUI): {adb.last_error}")
 
     step("Loading components...")
     splash.update()
 
     window = WindowManager(adb=adb)
-    step("Starting live video capture...")
-    splash.update()
-    window.start_video_capture()
+    if adb_connected:
+        step("Starting live video capture...")
+        splash.update()
+        window.start_video_capture()
     atexit.register(window.stop_video_capture)
     vision = VisionManager(config)
     automation = AutomationController(adb=adb)
-    controls = settings.get("controls") or {}
+    controls = ensure_default_controls(settings.get("controls"))
+    if settings.get("controls") != controls:
+        settings["controls"] = controls
+        save_settings(settings)
     waits = settings.get("waits") or {}
     recovery = settings.get("recovery") or {}
     attack = settings.get("attack") or {}
@@ -186,6 +173,16 @@ def main():
     brain = settings.get("brain") or {}
 
     msg_queue = queue.Queue()
+    if not adb_connected:
+        msg_queue.put(
+            {
+                "type": "log",
+                "text": (
+                    "[Siap Pakai] Emulator belum terdeteksi saat dibuka. "
+                    "Silakan nyalakan emulator lalu klik '🔌 Connect ADB' atau langsung klik '▶ Start Farming'!"
+                ),
+            }
+        )
     bot = CocBot(config, window, vision, automation, msg_queue, controls=controls, waits=waits, notifier=notifier, recovery=recovery, attack=attack, troops=troops, replay=replay, brain=brain)
 
     splash.destroy()

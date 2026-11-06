@@ -64,7 +64,7 @@ from PIL import Image, ImageTk
 
 from core.config import AppConfig
 from device.adb import EmulatorAdb
-from core.settings import load_settings, save_settings
+from core.settings import DEFAULT_CONTROLS, load_settings, save_settings
 from core.utils import user_path
 
 
@@ -159,6 +159,7 @@ class Calibrator:
             ("Undo", self.undo, "#5f6368"),
             ("Clear selected", self.clear_selected, "#a86418"),
             ("Clear all", self.clear_all, "#8b0000"),
+            ("Reset Preset", self.reset_preset, "#6d28d9"),
             ("Recapture", self.recapture, "#1a73e8"),
             ("Save to settings", self.save, "#188038"),
         ]:
@@ -416,6 +417,17 @@ class Calibrator:
         self._paint_rows()
         self._render()
         self._update_instruction()
+
+    def reset_preset(self):
+        self.controls = {k: dict(v) for k, v in DEFAULT_CONTROLS.items()}
+        for name, _ in BUTTONS:
+            self.status_labels[name].config(text=self._fmt(self.controls.get(name)))
+        self.index = len(BUTTONS)
+        self.fix_mode = False
+        self._paint_rows()
+        self._render()
+        self._update_instruction()
+        self.status_var.set("Restored Universal 16:9 CoC Control Preset!")
 
     def save(self):
         missing = [

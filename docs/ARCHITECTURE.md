@@ -1,59 +1,89 @@
-# Architecture
+# 🏗️ System Architecture (`Coc-DeepFarm v2.0`)
 
-## Overview
+<p align="center">
+  <img src="architecture_preview.png" alt="Coc-DeepFarm v2.0 System Architecture" width="100%">
+</p>
 
-Coc-DeepFarm observes the emulator, decides when and how to attack using its **Dual-Brain PyTorch Deep Learning System (`CoCCommanderNet` + `AttackPolicyNet`)**, and injects taps without requiring the emulator window to be focused or visible.
+---
 
-Input goes through **ADB** (`adb shell input tap`). Live capture uses an H.264 stream from Android `screenrecord`, decoded by FFmpeg. Fixed menu buttons use **calibrated normalized coordinates** stored in local `settings.json` plus optional OpenCV template verification (`templates/*.png`). YOLO + High-Contrast EasyOCR locate changing base layouts and read resource values.
+## 1. Architectural Philosophy
 
-## Runtime data flow
+**Coc-DeepFarm** follows **Clean Layered Architecture** combined with a **Dual-Brain PyTorch Deep Learning + Associative Memory** core:
+- **Zero Desktop Intrusion:** All video frames (`20 FPS H.264 stream` via `screenrecord` + FFmpeg) and touch events (`adb shell input`) travel directly over **ADB**, so your mouse cursor and active window focus are never hijacked.
+- **Zero External API / LLM Latency:** Instead of calling slow, rate-limited general-purpose text LLMs, **Coc-DeepFarm** runs two domain-specialized PyTorch neural networks (`CoCCommanderNet` and `AttackPolicyNet`) plus a topological vector memory (`BaseMemoryBank`) natively on your GPU (`CUDA:0`) in **`< 1 ms`**.
 
-```text
-                                  ┌─ ADB exec-out screenrecord ─ FFmpeg
-                                  │                                 │
-main.py ── device.WindowManager ──┴── VideoCaptureStream ───────────┤
-    │                                 (latest decoded frame)        │
-    ├── core.CocBot worker ── capture_window() ─────────────────────┤
-    │       ├── perception.VisionManager (YOLO / EasyOCR)           │
-    │       ├── ai.CoCTacticalBrain (CoCCommanderNet macro plan)    │
-    │       ├── ai.PolicyPlanner (AttackPolicyNet micro taps + RL)  │
-    │       └── device.AutomationController ── ADB batch input      │
-    │                                                               v
-    └── ui.BotGUI ── preview reader ── latest-frame slot ── Tk render loop
-                  └── event queue <── CocBot worker
+---
+
+## 2. End-to-End Runtime Data Flow
+
+```mermaid
+flowchart TD
+    subgraph Device["1. Device & Stream Layer (device/)"]
+        ADB["EmulatorAdb\n(Auto-Scan Ports)"]
+        STREAM["VideoCaptureStream\n(20 FPS H.264 -> RGB)"]
+        AUTO["AutomationController\n(Parallel Batch Taps)"]
+    end
+
+    subgraph Perception["2. Computer Vision Layer (perception/)"]
+        YOLO["Ultralytics YOLO\n(Storages & Collectors)"]
+        OCR["Dual-Pass EasyOCR\n(High-Contrast Loot Digits)"]
+        HSV["HSV Saturation Sensor\n(Empty Troop Slot Skip)"]
+    end
+
+    subgraph Brain["3. Dual-Brain AI & Memory Layer (ai/)"]
+        MEM["BaseMemoryBank (k-NN)\n(512 Base Topologies)"]
+        CMD["CoCCommanderNet (16-D)\n(Profit, Flank, Style, Timer)"]
+        POL["AttackPolicyNet (9-D)\n(Perimeter Offsets dx, dy, dt)"]
+        RL["Online RL Updater\n(Per-Wave & Post-Raid Backprop)"]
+    end
+
+    subgraph Core["4. Core State Machine (core/)"]
+        BOT["CocBot Orchestrator\n(Pre-Flight, Scouting, 360° Waves)"]
+    end
+
+    subgraph UI["5. Live Dashboard & Telemetry (ui/, services/)"]
+        GUI["BotGUI Dashboard\n(AI Radar Overlay + RL Curve)"]
+    end
+
+    ADB --> STREAM --> BOT
+    BOT --> YOLO & OCR & HSV
+    YOLO & OCR -->|16-D State| MEM & CMD
+    MEM -->|Recall Match| CMD
+    CMD -->|Macro Plan| BOT
+    BOT -->|Storage Coords| POL
+    POL -->|Perimeter Taps| AUTO --> ADB
+    BOT -->|Wave & Raid Outcome| RL
+    RL -->|Weight & Memory Update| CMD & POL & MEM
+    BOT -->|Live Telemetry| GUI
 ```
 
-## Clean Layered Package Structure
+---
 
-| Package / Module | Responsibility | Depends on |
-|---|---|---|
-| `main.py` | Application bootstrapper, `.venv` auto-switcher, `--selftest` | all packages |
-| `core/config.py` | `AppConfig` dataclass (model path, ADB defaults, class names) | — |
-| `core/settings.py` | Load/save `settings.json` seeded from `settings.example.json` | `core/utils.py` |
-| `core/bot.py` | `CocBot` farming state machine, multi-wave deployment, online RL loop | `ai/`, `perception/`, `device/`, `services/` |
-| `ai/brain.py` | `CoCCommanderNet` & `CoCTacticalBrain` (16-feature strategic neural net + online RL), `RuleBrain` | `torch`, `core/utils.py` |
-| `ai/policy_net.py` | `AttackPolicyNet` & `PolicyPlanner` (9-feature perimeter tap generator + wave/raid RL) | `torch`, `core/utils.py` |
-| `ai/video_learner.py` | `VideoAttackExtractor` (extracts human attack trajectories from `.mp4` videos) | `cv2`, `ai/brain.py`, `ai/policy_net.py` |
-| `perception/vision.py` | YOLO object detection + dual-pass high-contrast EasyOCR | `torch`, `ultralytics`, `easyocr` |
-| `perception/template_matcher.py` | Multi-scale OpenCV template matching for button verification | `cv2`, `numpy` |
-| `device/adb.py` | ADB transport, subshell batch tapping, H.264 stream decoder | `subprocess`, `cv2`, FFmpeg |
-| `device/window_manager.py` | Guest resolution, live frames, screenshot fallback | `device/adb.py` |
-| `device/automation.py` | High-level `click`, `tap_many`, `hold` controller | `device/adb.py` |
-| `services/logger.py` | Console & rotating file logging (`logs/bot.log`) | `logging` |
-| `services/notify.py` | Push notifications via `ntfy.sh` with compressed screenshots | `urllib` |
-| `services/replay.py` | Per-raid JSON telemetry (`logs/raid_*.json`) | `json` |
-| `ui/gui.py` | Dark-mode Tkinter dashboard, live telemetry, video trainer trigger | `tkinter`, `PIL`, `ai/` |
-| `ui/calibrate.py` | Interactive click/drag button calibrator & template cropper | `tkinter`, `PIL`, `device/adb.py` |
+## 3. Clean Layered Package Breakdown
 
-## Dual-Brain Deep Learning & Online Reinforcement Learning
+| Layer | Module | Key Classes / Functions | Responsibility |
+| :--- | :--- | :--- | :--- |
+| **Launcher** | [`Start-Bot.bat`](../Start-Bot.bat), [`main.py`](../main.py) | `_ensure_venv()`, `main()`, `_selftest()` | 1-Click `.venv` setup, CUDA detection, non-blocking ADB startup |
+| **Core** | [`core/bot.py`](../core/bot.py) | `CocBot` | Main farming state machine, Pre-Flight checks, 360° wave loop, Online RL triggers |
+| **Core** | [`core/settings.py`](../core/settings.py) | `DEFAULT_CONTROLS`, `ensure_default_controls()` | Universal 16:9 16-button preset and `settings.json` persistence |
+| **AI & Memory** | [`ai/brain.py`](../ai/brain.py) | `CoCCommanderNet`, `BaseMemoryBank`, `CoCTacticalBrain` | 16-D strategic neural network, k-NN topological memory recall, macro Online RL |
+| **AI & Memory** | [`ai/policy_net.py`](../ai/policy_net.py) | `AttackPolicyNet`, `PolicyPlanner` | 9-D micro perimeter tap generator, 256-sample Experience Replay, counterfactual RL |
+| **AI & Memory** | [`ai/video_learner.py`](../ai/video_learner.py) | `VideoAttackExtractor` | Extracts human tap bursts & storage layouts from `.mp4` videos |
+| **Perception** | [`perception/vision.py`](../perception/vision.py) | `VisionManager` | YOLO object detection + dual-pass binary threshold (`195`) EasyOCR |
+| **Perception** | [`perception/template_matcher.py`](../perception/template_matcher.py) | `find_template()`, `verify_screen_change()` | Multi-scale OpenCV button verification & popup dismissal |
+| **Device** | [`device/adb.py`](../device/adb.py) | `EmulatorAdb`, `VideoCaptureStream` | Multi-emulator ADB auto-discovery, subshell batch tapping, FFmpeg H.264 stream |
+| **UI** | [`ui/gui.py`](../ui/gui.py), [`ui/calibrate.py`](../ui/calibrate.py) | `BotGUI`, `Calibrator` | Dark-mode dashboard, Live AI Tactical Radar, RL Self-Learning Curve, 1-Click Reset Preset |
 
-1. **Pre-Raid Macro Decision (`CoCTacticalBrain.plan`)**:
-   - Extracts a 16-dimensional feature vector (`extract_base_features`) from OCR loot, target ratios, storage quadrant clustering, outer-ring collector exposure, and spread.
-   - `CoCCommanderNet` (`models/coc_commander.pt`) predicts `expected_profit`, `target_side` (`all`, `left`, `right`), `style_idx` (combo order vs fast goblin blitz), and `surrender_after_s` in `< 1 ms` on GPU.
-2. **In-Battle Micro Execution (`PolicyPlanner.predict_points`)**:
-   - `AttackPolicyNet` (`models/policy_net.pt`) predicts deployment offsets `(dx, dy)` and inter-tap delays `dt` for each storage, projecting coordinates onto the outer perimeter ring (`min_deploy_radius`) and avoiding the Surrender button bounding box.
-   - Between waves, `CocBot._filter_active_slots` checks HSV color saturation of each troop card to skip depleted (grayscale) slots.
-   - `PolicyPlanner.record_wave_feedback` compares detected storages before and after each wave (`+1.0` reward for destroyed storages, `-0.5` penalty for surviving storages).
-3. **Post-Raid Online Self-Learning (`learn_from_raid_outcome` & `learn_from_raid`)**:
-   - Computes realized reward from post-battle loot gain and storage drain ratio.
-   - Reinforces successful tap offsets and strategic choices, or applies counterfactual outward-perimeter & flank-tangent corrections when a raid underperforms, saving updated weights immediately to `models/policy_net.pt` and `models/coc_commander.pt`.
+---
+
+## 4. Three-Tier Neural Memory System
+
+**Coc-DeepFarm** combines three complementary forms of memory:
+
+1. **Short-Term Working Memory (`_current_episode` in [`ai/policy_net.py`](../ai/policy_net.py))**:
+   - Tracks every storage coordinate, predicted offset, and depleted troop slot (`_empty_slots`) across Waves 1–4 of the active battle.
+2. **Associative Topological Base Memory (`BaseMemoryBank` in [`ai/brain.py`](../ai/brain.py))**:
+   - Stores up to **512 encountered base layouts** in [`dataset/base_memory_bank.json`](../dataset/base_memory_bank.json).
+   - Uses weighted **Cosine Similarity** over spatial geometry (`dead_base`, `avg_dist`, quadrant densities, outer-ring exposure, and spread) to immediately recognize twin bases ($\ge 92\%$ match) and trigger either **`REINFORCE_WIN`** or **`AVOID_MISTAKE`**.
+3. **Long-Term Synaptic & Replay Memory ([`models/coc_commander.pt`](../models/coc_commander.pt), [`models/policy_net.pt`](../models/policy_net.pt))**:
+   - Backed by a **256-sample Experience Replay Buffer**, gradient norm clipping (`max_norm=0.5`), and adaptive learning-rate decay so the neural networks continuously improve without catastrophic forgetting.
